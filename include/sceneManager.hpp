@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Scene.hpp"
-#include "rasterCore.hpp"
+#include "sceneDescriptor.hpp"
 #include <string>
 #include <vector>
 
@@ -10,5 +10,11 @@ class SceneManager {
 		std::vector<SceneDescriptor> _scenesDesciptor;
 
 	public:
+		SceneManager() = default;
+		~SceneManager() = default;
 
+		Result	addScene(Scene* descriptor);
+		void	removeScene();
+		Result	loadScene(const std::string& sceneName);
+		Result	loadScene(uint32_t	index);
 };
