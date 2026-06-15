@@ -17,4 +17,6 @@ class SceneManager {
 		void	removeScene();
 		Result	loadScene(const std::string& sceneName);
 		Result	loadScene(uint32_t	index);
+
+		bool	init();
 };

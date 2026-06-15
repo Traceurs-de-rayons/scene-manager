@@ -19,6 +19,12 @@ void SceneManager::removeScene() { // trouver si pointeur / id / name
 //
 }
 
+bool SceneManager::init() {
+
+}
+
+
+
 Result SceneManager::loadScene(const std::string& sceneName) {
 	for (auto& descriptor : _scenesDesciptor) {
 		if (descriptor.getName() == sceneName) {
