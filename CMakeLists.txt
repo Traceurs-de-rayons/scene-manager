@@ -11,6 +11,7 @@ add_library(scene-manager STATIC ${SCENE_MANAGER_SOURCES})
 target_include_directories(scene-manager
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../render-api/external>
         $<INSTALL_INTERFACE:include>
 )
 
@@ -27,4 +28,8 @@ if(NOT TARGET raster-core)
 	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../raster-core raster-core-build)
 endif()
 
-target_link_libraries(scene-manager PUBLIC scene-core raster-core)
+if(NOT TARGET viewport_manager)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../viewport_manager viewport_manager-build)
+endif()
+
+target_link_libraries(scene-manager PUBLIC scene-core raster-core viewport_manager)
