@@ -217,13 +217,19 @@ void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 		light.intensity = data->intensity;
 		light.castsShadow = true; // the renderer decides which ones actually get a shadow map
 
-		// projection: 0 = Point, 1 = Directional (Asset::LightData is private)
+		// projection: 0 = Point, 1 = Directional, 2 = Spot (Asset::LightData is private)
 		if (const auto* point = std::get_if<0>(&data->projection)) {
 			light.type = RasterCore::LightType::Point;
 			light.position = {point->position.x, point->position.y, point->position.z};
 		} else if (const auto* directional = std::get_if<1>(&data->projection)) {
 			light.type = RasterCore::LightType::Directional;
 			light.direction = {directional->direction.x, directional->direction.y, directional->direction.z};
+		} else if (const auto* spot = std::get_if<2>(&data->projection)) {
+			light.type = RasterCore::LightType::Spot;
+			light.position = {spot->position.x, spot->position.y, spot->position.z};
+			light.direction = {spot->direction.x, spot->direction.y, spot->direction.z};
+			light.coneAngle = spot->angle;
+			light.coneBlend = spot->blend;
 		}
 		out.push_back(light);
 	}
