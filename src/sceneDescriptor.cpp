@@ -7,6 +7,7 @@
 #include "return.hpp"
 #include "stb_image.h"
 
+#include <cstring>
 #include <iostream>
 #include <vector>
 #include <vulkan/vulkan_core.h>
@@ -21,6 +22,10 @@ SceneDescriptor::~SceneDescriptor() {
 }
 
 Result SceneDescriptor::loadScene() {
+	// New geometry: whatever was rendered from the previous one (cached shadow maps) is stale.
+	++_resources.geometryVersion;
+	_uploadedMatrices.clear();
+
 	if (_isLoaded)
 		return Result::ok();
 
@@ -184,7 +189,14 @@ void SceneDescriptor::syncModelMatrices() {
 	if (matrices.empty())
 		return;
 
+	// Nothing moved: the buffer and everything rendered from it are still valid.
+	if (matrices.size() == _uploadedMatrices.size() &&
+		std::memcmp(matrices.data(), _uploadedMatrices.data(), matrices.size() * sizeof(mat4)) == 0)
+		return;
+
 	_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4));
+	_uploadedMatrices = std::move(matrices);
+	++_resources.geometryVersion;
 }
 
 void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {

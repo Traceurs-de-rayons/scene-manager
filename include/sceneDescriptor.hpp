@@ -6,6 +6,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 class SceneDescriptor {
 	private:
@@ -14,6 +15,7 @@ class SceneDescriptor {
 		RasterCore::SharedGpuResources	_resources;
 		bool							_isLoaded = false;
 		std::unordered_map<std::string, uint32_t> _textureIndexMap;
+		std::vector<mat4>				_uploadedMatrices; // model matrices currently on the GPU
 
 		Result	loadFromScene();
 		Result	loadFallbackPyramid();
