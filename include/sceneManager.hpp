@@ -20,6 +20,8 @@ class SceneManager {
 		renderApi::device::GPU*			_gpu = nullptr;
 		ViewportManager*				_viewportManager = nullptr;
 
+		Result				reloadScene(SceneDescriptor& descriptor);
+
 	public:
 		SceneManager() = default;
 		~SceneManager() = default;
@@ -35,6 +37,11 @@ class SceneManager {
 		Result				loadScene(uint32_t index);
 		Result				unloadScene(const std::string& sceneName);
 
+		// Rebuilds the GPU buffers of a loaded scene and rebinds the viewports showing it.
+		Result				reloadScene(const std::string& sceneName);
+
+		// Call once per frame: reloads the scenes whose assets were added or removed, then syncTransforms().
+		void				syncScenes();
 		void				syncTransforms();
 		// All lights of all loaded scenes (each scene lists its suns first).
 		std::vector<RasterCore::Light>	collectLights() const;

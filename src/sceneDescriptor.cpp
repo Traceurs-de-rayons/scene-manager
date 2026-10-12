@@ -35,6 +35,8 @@ Result SceneDescriptor::loadScene() {
 	if (!_scene)
 		return Result::error("SceneDescriptor '" + _name + "': no scene set");
 
+	_loadedStructureVersion = _scene->getStructureVersion();
+
 	if (_scene->getVertexAmount() == 0 || _scene->getIndexAmount() == 0) {
 		std::cout << "SceneDescriptor '" << _name << "': empty scene, loading fallback pyramid" << std::endl;
 		return loadFallbackPyramid();
@@ -58,6 +60,14 @@ static mat4 transposeMatrix(const mat4& m) {
 		for (int col = 0; col < 4; ++col)
 			r.m[col][row] = m.m[row][col];
 	return r;
+}
+
+// Hidden draws get a null matrix: every vertex collapses to one point, so nothing is rasterized
+// (main pass and shadow maps alike) and the draw list stays untouched.
+static mat4 drawCallMatrix(const DrawCallView& drawCall) {
+	if (!drawCall.visible)
+		return mat4(0.0f);
+	return transposeMatrix(drawCall.transform.getMatrix());
 }
 
 Result SceneDescriptor::loadFromScene() {
@@ -94,7 +104,7 @@ Result SceneDescriptor::loadFromScene() {
 	std::unordered_map<std::string, uint32_t> materialIds;
 
 	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-		matrices.push_back(transposeMatrix(drawCall.transform.getMatrix()));
+		matrices.push_back(drawCallMatrix(drawCall));
 
 		auto it = materialIds.find(drawCall.material.name);
 		uint32_t materialId;
@@ -183,7 +193,7 @@ void SceneDescriptor::syncModelMatrices() {
 
 	std::vector<mat4> matrices;
 	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-		matrices.push_back(transposeMatrix(drawCall.transform.getMatrix()));
+		matrices.push_back(drawCallMatrix(drawCall));
 	});
 
 	if (matrices.empty())
@@ -199,6 +209,10 @@ void SceneDescriptor::syncModelMatrices() {
 	++_resources.geometryVersion;
 }
 
+bool SceneDescriptor::needsReload() const {
+	return _isLoaded && _scene && _scene->getStructureVersion() != _loadedStructureVersion;
+}
+
 void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 	if (!_scene)
 		return;
@@ -206,7 +220,7 @@ void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 	// Suns first: they get the shadow map before plain directional lights.
 	for (const auto& [name, asset] : _scene->getAssets()) {
 		const auto* sun = asset.getType() == AssetType::Sun ? asset.getSunData() : nullptr;
-		if (!sun)
+		if (!sun || !asset.isVisible())
 			continue;
 
 		RasterCore::Light light;
@@ -221,7 +235,7 @@ void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 
 	for (const auto& [name, asset] : _scene->getAssets()) {
 		const auto* data = asset.getType() == AssetType::Light ? asset.getLightData() : nullptr;
-		if (!data)
+		if (!data || !asset.isVisible())
 			continue;
 
 		RasterCore::Light light;

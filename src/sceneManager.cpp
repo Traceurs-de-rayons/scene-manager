@@ -2,6 +2,7 @@
 #include "Scene.hpp"
 #include "return.hpp"
 #include "sceneDescriptor.hpp"
+#include "viewport.hpp"
 #include "viewportManager.hpp"
 
 #include <cstdint>
@@ -76,6 +77,53 @@ SceneDescriptor* SceneManager::getScene(uint32_t index) {
 	if (index >= _scenesDescriptor.size())
 		return nullptr;
 	return &_scenesDescriptor[index];
+}
+
+Result SceneManager::reloadScene(const std::string& sceneName) {
+	SceneDescriptor* descriptor = getScene(sceneName);
+	if (!descriptor)
+		return Result::error("Scene '" + sceneName + "' not found");
+	return reloadScene(*descriptor);
+}
+
+Result SceneManager::reloadScene(SceneDescriptor& descriptor) {
+	RasterCore::SharedGpuResources* resources = descriptor.getResources();
+
+	// The pipelines hold descriptor sets on the buffers about to be destroyed: drop them first.
+	std::vector<Viewport*> attached;
+	if (_viewportManager) {
+		for (const auto& viewport : _viewportManager->getViewports()) {
+			if (viewport && viewport->getSceneResources() == resources) {
+				attached.push_back(viewport.get());
+				viewport->setSceneResources(nullptr, "");
+			}
+		}
+	}
+
+	Result result = descriptor.unloadScene();
+	if (result.code != ResultCode::Error)
+		result = descriptor.loadScene();
+	if (result.code == ResultCode::Error)
+		return result;
+
+	for (Viewport* viewport : attached) {
+		Result bound = viewport->setSceneResources(resources, descriptor.getName());
+		if (bound.code == ResultCode::Error)
+			result = bound;
+	}
+	return result;
+}
+
+void SceneManager::syncScenes() {
+	for (auto& descriptor : _scenesDescriptor) {
+		if (!descriptor.needsReload())
+			continue;
+
+		Result result = reloadScene(descriptor);
+		if (result.code == ResultCode::Error)
+			std::cerr << "SceneManager: " << result.message << std::endl;
+	}
+	syncTransforms();
 }
 
 void SceneManager::syncTransforms() {

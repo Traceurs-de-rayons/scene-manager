@@ -16,6 +16,7 @@ class SceneDescriptor {
 		bool							_isLoaded = false;
 		std::unordered_map<std::string, uint32_t> _textureIndexMap;
 		std::vector<mat4>				_uploadedMatrices; // model matrices currently on the GPU
+		uint64_t						_loadedStructureVersion = 0; // Scene::getStructureVersion() the buffers were built from
 
 		Result	loadFromScene();
 		Result	loadFallbackPyramid();
@@ -35,6 +36,8 @@ class SceneDescriptor {
 		Result								loadScene();
 		Result								unloadScene();
 		void								syncModelMatrices();
+		// True when assets were added or removed since the GPU buffers were built.
+		bool								needsReload() const;
 		// Appends every sun and light asset of the scene, suns first (they get the cascaded shadows).
 		void								collectLights(std::vector<RasterCore::Light>& out) const;
 
