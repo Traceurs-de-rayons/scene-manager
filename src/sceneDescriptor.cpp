@@ -1,3 +1,5 @@
+#include <optional>
+#include <algorithm>
 #include "sceneDescriptor.hpp"
 #include "Scene.hpp"
 #include "Vertex.hpp"
@@ -46,6 +48,24 @@ Result SceneDescriptor::loadScene() {
 }
 
 
+// Size of the texture array of geometry.frag.
+static constexpr size_t kMaxSceneTextures = 128;
+// Largest width or height a scene texture is uploaded with.
+static constexpr int kMaxTextureSize = 2048;
+
+static std::optional<vec3> materialColor(const Material& material) {
+	if (material.albedo && std::holds_alternative<cu::math::vec3>(material.albedo->value))
+		return std::get<cu::math::vec3>(material.albedo->value);
+	return std::nullopt;
+}
+
+// 0 = plain surface, 1 = fully emissive.
+static float materialEmission(const Material& material) {
+	if (material.emission_strength && std::holds_alternative<float>(material.emission_strength->value))
+		return std::clamp(std::get<float>(material.emission_strength->value), 0.0f, 1.0f);
+	return 0.0f;
+}
+
 static std::string materialTextureName(const Material& material) {
 	if (material.albedo && std::holds_alternative<std::string>(material.albedo->value))
 		return std::get<std::string>(material.albedo->value);
@@ -70,6 +90,34 @@ static mat4 drawCallMatrix(const DrawCallView& drawCall) {
 	return transposeMatrix(drawCall.transform.getMatrix());
 }
 
+// Bone matrices of every skinned draw, one pose after the other, in the layout the shaders
+// expect. `firstBones`, when given, receives the drawInfoBuffer entry of each draw.
+static std::vector<mat4> collectBones(const Scene& scene, std::vector<uint32_t>* drawInfos = nullptr) {
+	std::vector<mat4> bones;
+	std::unordered_map<const std::vector<mat4>*, uint32_t> firstBones; // sub meshes of one asset share its pose
+
+	scene.forEachSubMesh([&](const DrawCallView& drawCall) {
+		uint32_t first = 0;
+		if (drawCall.bones) {
+			auto it = firstBones.find(drawCall.bones);
+			if (it == firstBones.end()) {
+				first = static_cast<uint32_t>(bones.size());
+				firstBones[drawCall.bones] = first;
+				for (const mat4& bone : *drawCall.bones)
+					bones.push_back(transposeMatrix(bone));
+			} else {
+				first = it->second;
+			}
+		}
+		if (drawInfos)
+			drawInfos->push_back(first | (drawCall.viewModel ? RasterCore::SharedGpuResources::kViewModelBit : 0u));
+	});
+
+	if (bones.empty())
+		bones.push_back(mat4::identity());
+	return bones;
+}
+
 Result SceneDescriptor::loadFromScene() {
 	_resources.vertexCount = _scene->getVertexAmount();
 	_resources.indexCount = _scene->getIndexAmount();
@@ -89,6 +137,16 @@ Result SceneDescriptor::loadFromScene() {
 			return Result::error("SceneDescriptor '" + _name + "': failed to upload vertices");
 	}
 
+	_resources.skinBuffer = renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, _resources.vertexCount);
+	if (!_resources.skinBuffer.isValid())
+		return Result::error("SceneDescriptor '" + _name + "': failed to create skin buffer");
+	{
+		std::vector<VertexSkin> skins(_resources.vertexCount);
+		_scene->loadVertexSkins(skins.data());
+		if (!_resources.skinBuffer.upload(skins.data(), skins.size() * sizeof(VertexSkin)))
+			return Result::error("SceneDescriptor '" + _name + "': failed to upload vertex skins");
+	}
+
 	{
 		std::vector<uint32_t> indices(_resources.indexCount);
 		_scene->loadIndices(indices.data());
@@ -97,11 +155,16 @@ Result SceneDescriptor::loadFromScene() {
 	}
 
 
-	std::vector<VkDrawIndexedIndirectCommand> drawCommands;
+	std::vector<VkDrawIndexedIndirectCommand>& drawCommands = _drawCommands;
+	drawCommands.clear();
+	_drawVisible.clear();
 	std::vector<mat4> matrices;
 	std::vector<uint32_t> perDrawMaterialIds;
 	std::vector<std::string> materialTextureNames;
-	std::unordered_map<std::string, uint32_t> materialIds;
+	std::vector<std::optional<vec3>> materialColors; // flat albedo of the materials that have no texture
+	std::vector<float> materialEmissions;
+	std::unordered_map<std::string, uint32_t>& materialIds = _materialIds;
+	materialIds.clear();
 
 	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
 		matrices.push_back(drawCallMatrix(drawCall));
@@ -112,6 +175,8 @@ Result SceneDescriptor::loadFromScene() {
 			materialId = static_cast<uint32_t>(materialTextureNames.size());
 			materialIds[drawCall.material.name] = materialId;
 			materialTextureNames.push_back(materialTextureName(drawCall.material));
+			materialColors.push_back(materialColor(drawCall.material));
+			materialEmissions.push_back(materialEmission(drawCall.material));
 		} else {
 			materialId = it->second;
 		}
@@ -119,12 +184,25 @@ Result SceneDescriptor::loadFromScene() {
 
 		VkDrawIndexedIndirectCommand cmd{};
 		cmd.indexCount    = drawCall.indecesCount;
-		cmd.instanceCount = 1;
+		cmd.instanceCount = drawCall.visible ? 1 : 0; // a hidden draw costs nothing: see syncModelMatrices()
 		cmd.firstIndex    = drawCall.indicesIndex;
 		cmd.vertexOffset  = static_cast<int32_t>(drawCall.verticesIndex);
 		cmd.firstInstance = 0;
 		drawCommands.push_back(cmd);
+		_drawVisible.push_back(drawCall.visible);
 	});
+
+	// Materials no draw uses yet get an id too: an asset may switch to one of them later
+	// (Asset::setMaterialOverride()) without anything being rebuilt.
+	for (const auto& [name, material] : _scene->getMaterials()) {
+		if (materialIds.find(name) != materialIds.end())
+			continue;
+		materialIds[name] = static_cast<uint32_t>(materialTextureNames.size());
+		materialTextureNames.push_back(materialTextureName(material));
+		materialColors.push_back(materialColor(material));
+		materialEmissions.push_back(materialEmission(material));
+	}
+	_uploadedMaterialIds = perDrawMaterialIds;
 
 	if (matrices.empty())
 		matrices.push_back(mat4::identity());
@@ -134,8 +212,9 @@ Result SceneDescriptor::loadFromScene() {
 		return Result::error("SceneDescriptor '" + _name + "': failed to create model matrix buffer");
 
 	_resources.drawCount = static_cast<uint32_t>(drawCommands.size());
-	_resources.drawCommandsBuffer = renderApi::createIndirectBuffer(
-		_resources.gpu, std::max<size_t>(1, drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)));
+	// Dynamic: showing or hiding an asset rewrites its instance count.
+	_resources.drawCommandsBuffer.create(_resources.gpu, std::max<size_t>(1, drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)),
+										 renderApi::BufferType::INDIRECT, renderApi::BufferUsage::DYNAMIC);
 	if (!_resources.drawCommandsBuffer.isValid())
 		return Result::error("SceneDescriptor '" + _name + "': failed to create draw commands buffer");
 	if (!drawCommands.empty() && !_resources.drawCommandsBuffer.upload(
@@ -143,7 +222,7 @@ Result SceneDescriptor::loadFromScene() {
 		return Result::error("SceneDescriptor '" + _name + "': failed to upload draw commands");
 
 	_resources.perDrawBuffer = renderApi::createStorageBuffer(
-		_resources.gpu, std::max<size_t>(1, perDrawMaterialIds.size() * sizeof(uint32_t)));
+		_resources.gpu, std::max<size_t>(1, perDrawMaterialIds.size() * sizeof(uint32_t)), renderApi::BufferUsage::DYNAMIC);
 	if (!_resources.perDrawBuffer.isValid())
 		return Result::error("SceneDescriptor '" + _name + "': failed to create per-draw buffer");
 	if (!perDrawMaterialIds.empty() && !_resources.perDrawBuffer.upload(
@@ -151,18 +230,57 @@ Result SceneDescriptor::loadFromScene() {
 		return Result::error("SceneDescriptor '" + _name + "': failed to upload per-draw data");
 
 
+	{
+		std::vector<uint32_t> drawInfos;
+		_uploadedBones = collectBones(*_scene, &drawInfos);
+		if (drawInfos.empty())
+			drawInfos.push_back(0);
+
+		_resources.boneBuffer = renderApi::createStorageBuffer(_resources.gpu, _uploadedBones, renderApi::BufferUsage::DYNAMIC);
+		_resources.drawInfoBuffer = renderApi::createStorageBuffer(_resources.gpu, drawInfos, renderApi::BufferUsage::DYNAMIC);
+		if (!_resources.boneBuffer.isValid() || !_resources.drawInfoBuffer.isValid())
+			return Result::error("SceneDescriptor '" + _name + "': failed to create bone buffers");
+	}
+
 	loadTextures();
-	if (_resources.textures.empty())
-		return ensureFallbackTexture();
+	// Texture 0 is what materials without any albedo sample: the first file texture, else white.
+	Result fallbackResult = ensureFallbackTexture();
+	if (fallbackResult.code == ResultCode::Error)
+		return fallbackResult;
 
-
+	// The shaders only sample textures: a flat color is a 1x1 texture, shared by the materials using it.
+	std::unordered_map<uint32_t, uint32_t> colorTextures;
 	std::vector<uint32_t> materialData;
 	materialData.reserve(materialTextureNames.size());
-	for (const std::string& texName : materialTextureNames) {
+	for (size_t i = 0; i < materialTextureNames.size(); ++i) {
+		const std::string& texName = materialTextureNames[i];
 		uint32_t textureIndex = 0;
 		auto it = _textureIndexMap.find(texName);
-		if (!texName.empty() && it != _textureIndexMap.end())
+		if (!texName.empty() && it != _textureIndexMap.end()) {
 			textureIndex = it->second;
+		} else if (materialColors[i]) {
+			const auto channel = [](float value) {
+				return static_cast<uint32_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+			};
+			const vec3& color = *materialColors[i];
+			// Alpha is the opposite of the emission: stylized graphs read it (RenderGraphConfig::toon()),
+			// the default one ignores it.
+			const uint32_t pixel = channel(color.x) | (channel(color.y) << 8) | (channel(color.z) << 16) |
+								   (channel(1.0f - materialEmissions[i]) << 24);
+
+			auto colorIt = colorTextures.find(pixel);
+			if (colorIt != colorTextures.end()) {
+				textureIndex = colorIt->second;
+			} else if (_resources.textures.size() < kMaxSceneTextures) {
+				renderApi::Texture colorTex = renderApi::createTexture2D(
+					_resources.gpu, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, &pixel, sizeof(pixel), false);
+				if (colorTex.isValid()) {
+					textureIndex = static_cast<uint32_t>(_resources.textures.size());
+					_resources.textures.push_back(std::move(colorTex));
+					colorTextures[pixel] = textureIndex;
+				}
+			}
+		}
 		materialData.push_back(textureIndex);
 	}
 	if (materialData.empty())
@@ -199,14 +317,57 @@ void SceneDescriptor::syncModelMatrices() {
 	if (matrices.empty())
 		return;
 
-	// Nothing moved: the buffer and everything rendered from it are still valid.
-	if (matrices.size() == _uploadedMatrices.size() &&
-		std::memcmp(matrices.data(), _uploadedMatrices.data(), matrices.size() * sizeof(mat4)) == 0)
-		return;
+	// Nothing moved: the buffers and everything rendered from them are still valid.
+	bool changed = false;
+	if (matrices.size() != _uploadedMatrices.size() ||
+		std::memcmp(matrices.data(), _uploadedMatrices.data(), matrices.size() * sizeof(mat4)) != 0) {
+		_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4));
+		_uploadedMatrices = std::move(matrices);
+		changed = true;
+	}
 
-	_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4));
-	_uploadedMatrices = std::move(matrices);
-	++_resources.geometryVersion;
+	// Poses: the set of skinned draws only changes with a reload, so the size always matches.
+	if (_resources.boneBuffer.isValid()) {
+		std::vector<mat4> bones = collectBones(*_scene);
+		if (bones.size() == _uploadedBones.size() &&
+			std::memcmp(bones.data(), _uploadedBones.data(), bones.size() * sizeof(mat4)) != 0) {
+			_resources.boneBuffer.upload(bones.data(), bones.size() * sizeof(mat4));
+			_uploadedBones = std::move(bones);
+			changed = true;
+		}
+	}
+
+	// Visibility: a hidden asset is taken out of the draw list (instance count 0), so its
+	// vertices are not even processed. Its null matrix only covers the frame in between.
+	if (_resources.drawCommandsBuffer.isValid() && !_drawCommands.empty()) {
+		std::vector<bool> visible;
+		visible.reserve(_drawVisible.size());
+		_scene->forEachSubMesh([&](const DrawCallView& drawCall) { visible.push_back(drawCall.visible); });
+		if (visible.size() == _drawVisible.size() && visible != _drawVisible) {
+			for (size_t i = 0; i < visible.size(); ++i)
+				_drawCommands[i].instanceCount = visible[i] ? 1 : 0;
+			_resources.drawCommandsBuffer.upload(_drawCommands.data(), _drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand));
+			_drawVisible = std::move(visible);
+			changed		 = true;
+		}
+	}
+
+	// Materials: an asset may have switched to another one of the scene.
+	if (_resources.perDrawBuffer.isValid() && !_uploadedMaterialIds.empty()) {
+		std::vector<uint32_t> ids;
+		ids.reserve(_uploadedMaterialIds.size());
+		_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
+			const auto it = _materialIds.find(drawCall.material.name);
+			ids.push_back(it != _materialIds.end() ? it->second : 0);
+		});
+		if (ids.size() == _uploadedMaterialIds.size() && ids != _uploadedMaterialIds) {
+			_resources.perDrawBuffer.upload(ids.data(), ids.size() * sizeof(uint32_t));
+			_uploadedMaterialIds = std::move(ids);
+		}
+	}
+
+	if (changed)
+		++_resources.geometryVersion;
 }
 
 bool SceneDescriptor::needsReload() const {
@@ -299,6 +460,16 @@ Result SceneDescriptor::loadFallbackPyramid() {
 	if (!_resources.modelMatrixBuffer.isValid())
 		return Result::error("SceneDescriptor '" + _name + "': failed to create model matrix buffer");
 
+	// Nothing is skinned, but the shaders still read these.
+	const std::vector<VertexSkin> skins(vertices.size());
+	const std::vector<uint32_t>	  drawInfos = {0};
+	_resources.skinBuffer = renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, _resources.vertexCount);
+	_resources.boneBuffer = renderApi::createStorageBuffer(_resources.gpu, matrices, renderApi::BufferUsage::DYNAMIC);
+	_resources.drawInfoBuffer = renderApi::createStorageBuffer(_resources.gpu, drawInfos, renderApi::BufferUsage::DYNAMIC);
+	if (!_resources.skinBuffer.isValid() || !_resources.boneBuffer.isValid() || !_resources.drawInfoBuffer.isValid() ||
+		!_resources.skinBuffer.upload(skins.data(), skins.size() * sizeof(VertexSkin)))
+		return Result::error("SceneDescriptor '" + _name + "': failed to create skinning buffers");
+
 	VkDrawIndexedIndirectCommand cmd{};
 	cmd.indexCount    = _resources.indexCount;
 	cmd.instanceCount = 1;
@@ -346,19 +517,48 @@ Result SceneDescriptor::loadTextures() {
 		return Result::ok();
 
 	for (const auto& [key, tex] : sceneTextures) {
-		if (!std::holds_alternative<Texture::FromFile>(tex.data))
-			continue;
-
-		const auto& ff = std::get<Texture::FromFile>(tex.data);
-		if (ff.path.empty())
-			continue;
-
+		// An image file, on disk or kept in memory (textures embedded in a .glb).
 		int w = 0, h = 0, channels = 0;
-		stbi_uc* pixels = stbi_load(ff.path.c_str(), &w, &h, &channels, STBI_rgb_alpha);
+		stbi_uc* pixels = nullptr;
+		std::string source;
+		if (const auto* encoded = std::get_if<Texture::Encoded>(&tex.data)) {
+			source = key;
+			pixels = stbi_load_from_memory(encoded->bytes.data(), static_cast<int>(encoded->bytes.size()), &w, &h, &channels, STBI_rgb_alpha);
+		} else if (const auto* file = std::get_if<Texture::FromFile>(&tex.data)) {
+			if (file->path.empty())
+				continue;
+			source = file->path;
+			pixels = stbi_load(file->path.c_str(), &w, &h, &channels, STBI_rgb_alpha);
+		} else {
+			continue;
+		}
 		if (!pixels) {
 			std::cerr << "SceneDescriptor '" << _name << "': failed to load texture '"
-					  << ff.path << "' (" << stbi_failure_reason() << ")" << std::endl;
+					  << source << "' (" << stbi_failure_reason() << ")" << std::endl;
 			continue;
+		}
+
+		// Larger images are halved until they fit: textures have no mip maps, so more texels
+		// would only cost memory and shimmer.
+		std::vector<stbi_uc> reduced;
+		const stbi_uc* texels = pixels;
+		while (w > kMaxTextureSize || h > kMaxTextureSize) {
+			const int halfW = std::max(w / 2, 1), halfH = std::max(h / 2, 1);
+			std::vector<stbi_uc> half(static_cast<size_t>(halfW) * halfH * 4);
+			for (int y = 0; y < halfH; ++y) {
+				for (int x = 0; x < halfW; ++x) {
+					const int x1 = std::min(x * 2 + 1, w - 1), y1 = std::min(y * 2 + 1, h - 1);
+					for (int c = 0; c < 4; ++c) {
+						const int sum = texels[(static_cast<size_t>(y * 2) * w + x * 2) * 4 + c] + texels[(static_cast<size_t>(y * 2) * w + x1) * 4 + c] +
+										texels[(static_cast<size_t>(y1) * w + x * 2) * 4 + c] + texels[(static_cast<size_t>(y1) * w + x1) * 4 + c];
+						half[(static_cast<size_t>(y) * halfW + x) * 4 + c] = static_cast<stbi_uc>((sum + 2) / 4);
+					}
+				}
+			}
+			reduced = std::move(half);
+			texels	= reduced.data();
+			w = halfW;
+			h = halfH;
 		}
 
 		renderApi::Texture gpuTex = renderApi::createTexture2D(
@@ -366,7 +566,7 @@ Result SceneDescriptor::loadTextures() {
 			static_cast<uint32_t>(w),
 			static_cast<uint32_t>(h),
 			VK_FORMAT_R8G8B8A8_UNORM,
-			pixels,
+			texels,
 			static_cast<size_t>(w) * h * 4,
 			false);
 
@@ -374,7 +574,7 @@ Result SceneDescriptor::loadTextures() {
 
 		if (!gpuTex.isValid()) {
 			std::cerr << "SceneDescriptor '" << _name << "': failed to create GPU texture '"
-					  << ff.path << "'" << std::endl;
+					  << source << "'" << std::endl;
 			continue;
 		}
 

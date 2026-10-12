@@ -16,6 +16,11 @@ class SceneDescriptor {
 		bool							_isLoaded = false;
 		std::unordered_map<std::string, uint32_t> _textureIndexMap;
 		std::vector<mat4>				_uploadedMatrices; // model matrices currently on the GPU
+		std::vector<mat4>				_uploadedBones;	   // bone matrices currently on the GPU
+		std::unordered_map<std::string, uint32_t> _materialIds; // id of every material of the scene in the material buffer
+		std::vector<uint32_t>			_uploadedMaterialIds;	 // material id of each draw currently on the GPU
+		std::vector<VkDrawIndexedIndirectCommand> _drawCommands; // draw list currently on the GPU
+		std::vector<bool>				_drawVisible;			 // which draws have an instance
 		uint64_t						_loadedStructureVersion = 0; // Scene::getStructureVersion() the buffers were built from
 
 		Result	loadFromScene();
