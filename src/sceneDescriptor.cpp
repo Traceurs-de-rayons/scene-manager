@@ -212,14 +212,9 @@ Result SceneDescriptor::loadFromScene() {
 		return Result::error("SceneDescriptor '" + _name + "': failed to create model matrix buffer");
 
 	_resources.drawCount = static_cast<uint32_t>(drawCommands.size());
-	// Dynamic: showing or hiding an asset rewrites its instance count.
-	_resources.drawCommandsBuffer.create(_resources.gpu, std::max<size_t>(1, drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)),
-										 renderApi::BufferType::INDIRECT, renderApi::BufferUsage::DYNAMIC);
-	if (!_resources.drawCommandsBuffer.isValid())
+	// Showing or hiding an asset changes its instance count: see SharedGpuResources::drawCommands.
+	if (!_resources.createDrawCommands(drawCommands.data(), drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)))
 		return Result::error("SceneDescriptor '" + _name + "': failed to create draw commands buffer");
-	if (!drawCommands.empty() && !_resources.drawCommandsBuffer.upload(
-			drawCommands.data(), drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload draw commands");
 
 	_resources.perDrawBuffer = renderApi::createStorageBuffer(
 		_resources.gpu, std::max<size_t>(1, perDrawMaterialIds.size() * sizeof(uint32_t)), renderApi::BufferUsage::DYNAMIC);
@@ -339,14 +334,15 @@ void SceneDescriptor::syncModelMatrices() {
 
 	// Visibility: a hidden asset is taken out of the draw list (instance count 0), so its
 	// vertices are not even processed. Its null matrix only covers the frame in between.
-	if (_resources.drawCommandsBuffer.isValid() && !_drawCommands.empty()) {
+	if (_resources.drawCommandsBuffer().isValid() && !_drawCommands.empty()) {
 		std::vector<bool> visible;
 		visible.reserve(_drawVisible.size());
 		_scene->forEachSubMesh([&](const DrawCallView& drawCall) { visible.push_back(drawCall.visible); });
 		if (visible.size() == _drawVisible.size() && visible != _drawVisible) {
 			for (size_t i = 0; i < visible.size(); ++i)
 				_drawCommands[i].instanceCount = visible[i] ? 1 : 0;
-			_resources.drawCommandsBuffer.upload(_drawCommands.data(), _drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand));
+			// Into another buffer than the one the frames in flight read (see SharedGpuResources).
+			_resources.setDrawCommands(_drawCommands.data(), _drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand));
 			_drawVisible = std::move(visible);
 			changed		 = true;
 		}
@@ -478,11 +474,8 @@ Result SceneDescriptor::loadFallbackPyramid() {
 	cmd.firstInstance = 0;
 
 	_resources.drawCount = 1;
-	_resources.drawCommandsBuffer = renderApi::createIndirectBuffer(_resources.gpu, sizeof(cmd));
-	if (!_resources.drawCommandsBuffer.isValid())
+	if (!_resources.createDrawCommands(&cmd, sizeof(cmd)))
 		return Result::error("SceneDescriptor '" + _name + "': failed to create draw commands buffer");
-	if (!_resources.drawCommandsBuffer.upload(&cmd, sizeof(cmd)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload draw commands");
 
 	const uint32_t zero = 0;
 	_resources.perDrawBuffer = renderApi::createStorageBuffer(_resources.gpu, sizeof(uint32_t));
