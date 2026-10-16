@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <optional>
 #include <algorithm>
 #include "sceneDescriptor.hpp"
@@ -509,7 +510,28 @@ Result SceneDescriptor::loadTextures() {
 	if (sceneTextures.empty())
 		return Result::ok();
 
+	// The same image under several names (a model added to another one copies its textures, the
+	// same file taken by two models) is uploaded once: the shaders hold kMaxSceneTextures at most.
+	std::unordered_map<std::string, uint32_t> sameImage;
 	for (const auto& [key, tex] : sceneTextures) {
+		std::string identity;
+		if (const auto* encoded = std::get_if<Texture::Encoded>(&tex.data)) {
+			uint64_t hash = 1469598103934665603ull;
+			for (const uint8_t byte : encoded->bytes)
+				hash = (hash ^ byte) * 1099511628211ull;
+			identity = "data:" + std::to_string(encoded->bytes.size()) + ":" + std::to_string(hash);
+		} else if (const auto* file = std::get_if<Texture::FromFile>(&tex.data)) {
+			identity = "file:" + file->path;
+		}
+		if (const auto same = sameImage.find(identity); !identity.empty() && same != sameImage.end()) {
+			_textureIndexMap[key] = same->second;
+			continue;
+		}
+		if (_resources.textures.size() >= kMaxSceneTextures) {
+			std::cerr << "SceneDescriptor '" << _name << "': more than " << kMaxSceneTextures << " textures, '" << key << "' left out" << std::endl;
+			continue;
+		}
+
 		// An image file, on disk or kept in memory (textures embedded in a .glb).
 		int w = 0, h = 0, channels = 0;
 		stbi_uc* pixels = nullptr;
@@ -572,6 +594,8 @@ Result SceneDescriptor::loadTextures() {
 		}
 
 		_textureIndexMap[key] = static_cast<uint32_t>(_resources.textures.size());
+		if (!identity.empty())
+			sameImage[identity] = _textureIndexMap[key];
 		_resources.textures.push_back(std::move(gpuTex));
 		std::cout << "SceneDescriptor '" << _name << "': texture '" << tex.name
 				  << "' (" << w << "x" << h << ") uploaded" << std::endl;
