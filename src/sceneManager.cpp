@@ -100,7 +100,8 @@ Result SceneManager::reloadScene(SceneDescriptor& descriptor) {
 		}
 	}
 
-	Result result = descriptor.unloadScene();
+	// The images rarely change with the geometry: they are kept rather than decoded again.
+	Result result = descriptor.unloadScene(true);
 	if (result.code != ResultCode::Error)
 		result = descriptor.loadScene();
 	if (result.code == ResultCode::Error)

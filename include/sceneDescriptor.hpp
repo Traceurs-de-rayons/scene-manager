@@ -15,6 +15,8 @@ class SceneDescriptor {
 		RasterCore::SharedGpuResources	_resources;
 		bool							_isLoaded = false;
 		std::unordered_map<std::string, uint32_t> _textureIndexMap;
+		std::vector<std::string>		_textureIdentities; // image of each texture of _resources (empty: a flat color or the fallback)
+		std::unordered_map<std::string, renderApi::Texture> _keptTextures; // images of the last load, reused by the next one
 		std::vector<mat4>				_uploadedMatrices; // model matrices currently on the GPU
 		std::vector<mat4>				_uploadedBones;	   // bone matrices currently on the GPU
 		std::unordered_map<std::string, uint32_t> _materialIds; // id of every material of the scene in the material buffer
@@ -39,7 +41,9 @@ class SceneDescriptor {
 		SceneDescriptor& operator=(SceneDescriptor&&) = default;
 
 		Result								loadScene();
-		Result								unloadScene();
+		// keepTextures: the image textures are kept for the next loadScene(), which takes back
+		// those it still needs instead of decoding and uploading them again.
+		Result								unloadScene(bool keepTextures = false);
 		void								syncModelMatrices();
 		// True when assets were added or removed since the GPU buffers were built.
 		bool								needsReload() const;

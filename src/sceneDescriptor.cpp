@@ -505,6 +505,17 @@ Result SceneDescriptor::loadTextures() {
 		return Result::ok();
 
 	_textureIndexMap.clear();
+	_textureIdentities.assign(_resources.textures.size(), "");
+
+	// What the last load kept and this one does not take back is no longer used.
+	struct DropUnused {
+		std::unordered_map<std::string, renderApi::Texture>& kept;
+		~DropUnused() {
+			for (auto& [identity, texture] : kept)
+				texture.destroy();
+			kept.clear();
+		}
+	} dropUnused{_keptTextures};
 
 	const auto& sceneTextures = _scene->getTextures();
 	if (sceneTextures.empty())
@@ -529,6 +540,14 @@ Result SceneDescriptor::loadTextures() {
 		}
 		if (_resources.textures.size() >= kMaxSceneTextures) {
 			std::cerr << "SceneDescriptor '" << _name << "': more than " << kMaxSceneTextures << " textures, '" << key << "' left out" << std::endl;
+			continue;
+		}
+		if (const auto kept = _keptTextures.find(identity); !identity.empty() && kept != _keptTextures.end()) {
+			_textureIndexMap[key] = static_cast<uint32_t>(_resources.textures.size());
+			sameImage[identity]	  = _textureIndexMap[key];
+			_resources.textures.push_back(std::move(kept->second));
+			_textureIdentities.push_back(identity);
+			_keptTextures.erase(kept);
 			continue;
 		}
 
@@ -597,6 +616,7 @@ Result SceneDescriptor::loadTextures() {
 		if (!identity.empty())
 			sameImage[identity] = _textureIndexMap[key];
 		_resources.textures.push_back(std::move(gpuTex));
+		_textureIdentities.push_back(identity);
 		std::cout << "SceneDescriptor '" << _name << "': texture '" << tex.name
 				  << "' (" << w << "x" << h << ") uploaded" << std::endl;
 	}
@@ -618,13 +638,23 @@ Result SceneDescriptor::ensureFallbackTexture() {
 	return Result::ok();
 }
 
-Result SceneDescriptor::unloadScene() {
+Result SceneDescriptor::unloadScene(bool keepTextures) {
+	if (!keepTextures) {
+		for (auto& [identity, texture] : _keptTextures)
+			texture.destroy();
+		_keptTextures.clear();
+	}
 	if (!_isLoaded)
 		return Result::ok();
 
 	if (_resources.gpu)
 		vkDeviceWaitIdle(_resources.gpu->device);
 
+	if (keepTextures)
+		for (size_t i = 0; i < _resources.textures.size() && i < _textureIdentities.size(); ++i)
+			if (!_textureIdentities[i].empty())
+				_keptTextures[_textureIdentities[i]] = std::move(_resources.textures[i]);
+	_textureIdentities.clear();
 	_resources.destroy();
 	_isLoaded = false;
 	std::cout << "SceneDescriptor '" << _name << "': unloaded" << std::endl;
