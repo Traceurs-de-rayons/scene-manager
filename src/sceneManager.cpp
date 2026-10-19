@@ -5,8 +5,11 @@
 #include "viewport.hpp"
 #include "viewportManager.hpp"
 
+#include "renderDevice.hpp"
+
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 
 bool SceneManager::init(renderApi::device::GPU* gpu) {
 	if (!gpu) {
@@ -115,14 +118,43 @@ Result SceneManager::reloadScene(SceneDescriptor& descriptor) {
 	return result;
 }
 
+Result SceneManager::updateScene(SceneDescriptor& descriptor) {
+	RasterCore::SharedGpuResources* resources = descriptor.getResources();
+	if (!resources->gpu)
+		return Result::error("Scene '" + descriptor.getName() + "' has no GPU");
+
+	// The GPU thread holds this lock while it records and runs a frame of each viewport: from here
+	// on nothing reads the scene buffers, which may be grown, written or replaced.
+	const auto lock = resources->gpu->lockTasks();
+	Result result = descriptor.update();
+	if (result.code == ResultCode::Error)
+		return result;
+	if (_viewportManager)
+		for (const auto& viewport : _viewportManager->getViewports())
+			if (viewport && viewport->getSceneResources() == resources)
+				viewport->refreshSceneBindings();
+	return result;
+}
+
 void SceneManager::syncScenes() {
 	for (auto& descriptor : _scenesDescriptor) {
 		if (!descriptor.needsReload())
 			continue;
 
-		Result result = reloadScene(descriptor);
-		if (result.code == ResultCode::Error)
-			std::cerr << "SceneManager: " << result.message << std::endl;
+		// In place when it can; from scratch otherwise (the placeholder of an empty scene, a
+		// failed update), which also rebuilds the viewports.
+		bool updated = false;
+		if (descriptor.canUpdate()) {
+			const Result result = updateScene(descriptor);
+			updated				= result.code != ResultCode::Error;
+			if (!updated)
+				std::cerr << "SceneManager: " << result.message << ", loading the scene again" << std::endl;
+		}
+		if (!updated) {
+			const Result result = reloadScene(descriptor);
+			if (result.code == ResultCode::Error)
+				std::cerr << "SceneManager: " << result.message << std::endl;
+		}
 	}
 	syncTransforms();
 }

@@ -1,11 +1,16 @@
 #pragma once
 
 #include "Scene.hpp"
+#include "rangeAllocator.hpp"
 #include "rasterCore.hpp"
 #include "return.hpp"
 
+#include <map>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 class SceneDescriptor {
@@ -25,10 +30,38 @@ class SceneDescriptor {
 		std::vector<bool>				_drawVisible;			 // which draws have an instance
 		uint64_t						_loadedStructureVersion = 0; // Scene::getStructureVersion() the buffers were built from
 
+		// Where each piece of geometry of the scene is in the vertex, skin and index buffers (see
+		// update()), by who it is: (the shared geometry of a model, or none; the id of a mesh of
+		// its own, or 0).
+		struct GeometryRanges {
+			std::shared_ptr<const ModelMesh> shared; // held while it is on the GPU: no other geometry takes its address
+			uint32_t firstVertex = 0;
+			uint32_t vertexCount = 0;
+			std::vector<std::pair<uint32_t, uint32_t>> indexRanges; // first index and count of each list of it
+			std::vector<uint32_t> firstIndex;						 // of each sub mesh
+		};
+		std::map<std::pair<const void*, uint64_t>, GeometryRanges> _geometry;
+		RangeAllocator					_vertexRanges; // of the vertex and skin buffers
+		RangeAllocator					_indexRanges;
+		bool							_incremental = false; // built by loadFromScene(): update() keeps it current
+
+		// The materials, by id (_materialIds): what their texture is made of.
+		struct MaterialSource {
+			std::string			texture;		 // name of an image texture of the scene, or empty
+			std::optional<vec3>	color;			 // flat albedo, when there is no texture
+			float				emission = 0.0f; // 0..1
+		};
+		std::vector<MaterialSource>		_materialSources;
+		std::unordered_map<std::string, uint32_t> _sameImage;	  // image identity -> its texture: the same image under several names
+		std::unordered_map<uint32_t, uint32_t>	  _colorTextures; // RGBA of a flat color -> its 1x1 texture
+
 		Result	loadFromScene();
 		Result	loadFallbackPyramid();
 		Result	loadTextures();
 		Result	ensureFallbackTexture();
+		Result	placeGeometry();
+		Result	updateMaterials();
+		Result	buildDraws();
 
 	public:
 		SceneDescriptor() = default;
@@ -47,6 +80,15 @@ class SceneDescriptor {
 		void								syncModelMatrices();
 		// True when assets were added or removed since the GPU buffers were built.
 		bool								needsReload() const;
+		// Brings the GPU buffers to what the scene holds now, keeping what is already there: new
+		// geometry is uploaded into free room, what left gives its room back, a buffer that is too
+		// small grows (its content copied), textures and materials are only added. Nothing is
+		// destroyed and made again. The caller holds GPU::GpuTasksMutex, so that no frame reads
+		// the buffers meanwhile, then calls Viewport::refreshSceneBindings() on the viewports
+		// showing the scene. After an error the buffers are not usable: unloadScene(), loadScene().
+		Result								update();
+		// Whether update() can follow the scene: loaded, and not the placeholder of an empty scene.
+		bool								canUpdate() const;
 		// Appends every sun and light asset of the scene, suns first (they get the cascaded shadows).
 		void								collectLights(std::vector<RasterCore::Light>& out) const;
 

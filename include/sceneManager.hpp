@@ -21,6 +21,9 @@ class SceneManager {
 		ViewportManager*				_viewportManager = nullptr;
 
 		Result				reloadScene(SceneDescriptor& descriptor);
+		// SceneDescriptor::update() while no frame of a viewport runs, then the viewports showing
+		// the scene take its buffers again; nothing is destroyed or made again.
+		Result				updateScene(SceneDescriptor& descriptor);
 
 	public:
 		SceneManager() = default;
@@ -40,7 +43,8 @@ class SceneManager {
 		// Rebuilds the GPU buffers of a loaded scene and rebinds the viewports showing it.
 		Result				reloadScene(const std::string& sceneName);
 
-		// Call once per frame: reloads the scenes whose assets were added or removed, then syncTransforms().
+		// Call once per frame: brings the GPU buffers of the scenes whose assets were added or removed
+		// up to date (in place; loaded again only when that fails), then syncTransforms().
 		void				syncScenes();
 		void				syncTransforms();
 		// All lights of all loaded scenes (each scene lists its suns first).

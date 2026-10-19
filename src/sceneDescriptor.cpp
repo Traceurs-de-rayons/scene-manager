@@ -119,153 +119,295 @@ static std::vector<mat4> collectBones(const Scene& scene, std::vector<uint32_t>*
 	return bones;
 }
 
-Result SceneDescriptor::loadFromScene() {
-	_resources.vertexCount = _scene->getVertexAmount();
-	_resources.indexCount = _scene->getIndexAmount();
+namespace {
 
-	_resources.vertexBuffer = renderApi::createVertexBuffer<Vertex>(_resources.gpu, _resources.vertexCount);
-	if (!_resources.vertexBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create vertex buffer");
+	// Copies into GPU buffers, gathered in one staging buffer and sent in one submission.
+	class UploadBatch {
+		private:
+			struct Copy {
+				VkBuffer	 target;
+				VkDeviceSize offset;
+				VkDeviceSize from;
+				VkDeviceSize size;
+			};
+			std::vector<uint8_t> _bytes;
+			std::vector<Copy>	 _copies;
 
-	_resources.indexBuffer = renderApi::createIndexBuffer<uint32_t>(_resources.gpu, _resources.indexCount);
-	if (!_resources.indexBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create index buffer");
+		public:
+			// `size` bytes of `data` (zeros when it is null) at `offset` of `target`.
+			void add(const renderApi::Buffer& target, size_t offset, const void* data, size_t size) {
+				if (size == 0)
+					return;
+				const size_t from = _bytes.size();
+				_bytes.resize(from + size);
+				if (data)
+					std::memcpy(_bytes.data() + from, data, size);
+				else
+					std::memset(_bytes.data() + from, 0, size);
+				_copies.push_back({target.getHandle(), offset, from, size});
+			}
 
-	{
-		std::vector<Vertex> vertices(_resources.vertexCount);
-		_scene->loadVertices(vertices.data());
-		if (!_resources.vertexBuffer.upload(vertices.data(), vertices.size() * sizeof(Vertex)))
-			return Result::error("SceneDescriptor '" + _name + "': failed to upload vertices");
-	}
+			bool submit(renderApi::device::GPU* gpu) {
+				if (_copies.empty())
+					return true;
+				renderApi::Buffer staging = renderApi::createStagingBuffer(gpu, _bytes.size());
+				void*			  to	  = staging.isValid() ? staging.map() : nullptr;
+				if (!to)
+					return false;
+				std::memcpy(to, _bytes.data(), _bytes.size());
+				staging.unmap();
+				VkCommandBuffer cmd = gpu->beginOneTimeCommands();
+				for (const Copy& copy : _copies) {
+					const VkBufferCopy region{copy.from, copy.offset, copy.size};
+					vkCmdCopyBuffer(cmd, staging.getHandle(), copy.target, 1, &region);
+				}
+				gpu->endOneTimeCommands(cmd); // waits for the copies
+				return true;
+			}
+	};
 
-	_resources.skinBuffer = renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, _resources.vertexCount);
-	if (!_resources.skinBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create skin buffer");
-	{
-		std::vector<VertexSkin> skins(_resources.vertexCount);
-		_scene->loadVertexSkins(skins.data());
-		if (!_resources.skinBuffer.upload(skins.data(), skins.size() * sizeof(VertexSkin)))
-			return Result::error("SceneDescriptor '" + _name + "': failed to upload vertex skins");
-	}
-
-	{
-		std::vector<uint32_t> indices(_resources.indexCount);
-		_scene->loadIndices(indices.data());
-		if (!_resources.indexBuffer.upload(indices.data(), indices.size() * sizeof(uint32_t)))
-			return Result::error("SceneDescriptor '" + _name + "': failed to upload indices");
-	}
-
-
-	std::vector<VkDrawIndexedIndirectCommand>& drawCommands = _drawCommands;
-	drawCommands.clear();
-	_drawVisible.clear();
-	std::vector<mat4> matrices;
-	std::vector<uint32_t> perDrawMaterialIds;
-	std::vector<std::string> materialTextureNames;
-	std::vector<std::optional<vec3>> materialColors; // flat albedo of the materials that have no texture
-	std::vector<float> materialEmissions;
-	std::unordered_map<std::string, uint32_t>& materialIds = _materialIds;
-	materialIds.clear();
-
-	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-		matrices.push_back(drawCallMatrix(drawCall));
-
-		auto it = materialIds.find(drawCall.material.name);
-		uint32_t materialId;
-		if (it == materialIds.end()) {
-			materialId = static_cast<uint32_t>(materialTextureNames.size());
-			materialIds[drawCall.material.name] = materialId;
-			materialTextureNames.push_back(materialTextureName(drawCall.material));
-			materialColors.push_back(materialColor(drawCall.material));
-			materialEmissions.push_back(materialEmission(drawCall.material));
-		} else {
-			materialId = it->second;
+	// A device buffer of `bytes`, holding what `buffer` held: made larger only when it is too small.
+	bool growBuffer(renderApi::device::GPU* gpu, renderApi::Buffer& buffer, size_t bytes, renderApi::BufferType type) {
+		if (buffer.isValid() && buffer.getSize() >= bytes)
+			return true;
+		renderApi::Buffer larger;
+		if (!larger.create(gpu, std::max<size_t>(bytes, 16), type, renderApi::BufferUsage::STATIC))
+			return false;
+		if (buffer.isValid() && buffer.getSize() > 0) {
+			VkCommandBuffer	   cmd = gpu->beginOneTimeCommands();
+			const VkBufferCopy region{0, 0, buffer.getSize()};
+			vkCmdCopyBuffer(cmd, buffer.getHandle(), larger.getHandle(), 1, &region);
+			gpu->endOneTimeCommands(cmd);
 		}
-		perDrawMaterialIds.push_back(materialId);
+		buffer = std::move(larger);
+		return true;
+	}
 
-		VkDrawIndexedIndirectCommand cmd{};
-		cmd.indexCount    = drawCall.indecesCount;
-		cmd.instanceCount = drawCall.visible ? 1 : 0; // a hidden draw costs nothing: see syncModelMatrices()
-		cmd.firstIndex    = drawCall.indicesIndex;
-		cmd.vertexOffset  = static_cast<int32_t>(drawCall.verticesIndex);
-		cmd.firstInstance = 0;
-		drawCommands.push_back(cmd);
-		_drawVisible.push_back(drawCall.visible);
+	// Room for at least `bytes`: made again, half as large again, only when it is too small (what
+	// it held is lost: the caller writes it all).
+	bool ensureRoom(renderApi::device::GPU* gpu, renderApi::Buffer& buffer, size_t bytes, renderApi::BufferType type, renderApi::BufferUsage usage) {
+		bytes = std::max<size_t>(bytes, 16);
+		if (buffer.isValid() && buffer.getSize() >= bytes)
+			return true;
+		renderApi::Buffer larger;
+		if (!larger.create(gpu, bytes + bytes / 2, type, usage))
+			return false;
+		buffer = std::move(larger);
+		return true;
+	}
+
+	// Where `count` free elements are, the allocator grown (at least doubled) when it has no such room.
+	uint32_t take(RangeAllocator& ranges, uint32_t count) {
+		if (const auto first = ranges.allocate(count))
+			return *first;
+		ranges.grow(std::max(ranges.capacity() * 2, ranges.capacity() + count));
+		return *ranges.allocate(count);
+	}
+
+}
+
+Result SceneDescriptor::loadFromScene() {
+	// Room for the scene and some more: assets added later go there, nothing is made again.
+	const uint32_t vertices = _scene->getVertexAmount(), indices = _scene->getIndexAmount();
+	const uint32_t vertexRoom = vertices + vertices / 4 + 4096, indexRoom = indices + indices / 4 + 12288;
+	_geometry.clear();
+	_vertexRanges.reset(vertexRoom);
+	_indexRanges.reset(indexRoom);
+	_textureIndexMap.clear();
+	_sameImage.clear();
+	_colorTextures.clear();
+	_materialIds.clear();
+	_materialSources.clear();
+	_textureIdentities.clear();
+
+	_resources.vertexBuffer = renderApi::createVertexBuffer<Vertex>(_resources.gpu, vertexRoom);
+	_resources.skinBuffer	= renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, vertexRoom);
+	_resources.indexBuffer	= renderApi::createIndexBuffer<uint32_t>(_resources.gpu, indexRoom);
+	if (!_resources.vertexBuffer.isValid() || !_resources.skinBuffer.isValid() || !_resources.indexBuffer.isValid())
+		return Result::error("SceneDescriptor '" + _name + "': failed to create the geometry buffers");
+
+	Result result = update();
+	if (result.code == ResultCode::Error)
+		return result;
+
+	_isLoaded	 = true;
+	_incremental = true;
+	std::cout << "SceneDescriptor '" << _name << "': loaded ("
+		  << _resources.vertexCount << " vertices, "
+		  << _resources.indexCount << " indices, "
+		  << _resources.drawCount << " draws, "
+		  << _materialSources.size() << " materials, "
+		  << _resources.textures.size() << " textures)" << std::endl;
+	return Result::ok();
+}
+
+Result SceneDescriptor::update() {
+	if (!_scene || !_resources.gpu)
+		return Result::error("SceneDescriptor '" + _name + "': no scene or GPU to update from");
+
+	// New geometry: whatever was rendered from the previous one (cached shadow maps) is stale.
+	++_resources.geometryVersion;
+	_loadedStructureVersion = _scene->getStructureVersion();
+
+	Result result = placeGeometry();
+	if (result.code != ResultCode::Error)
+		result = updateMaterials();
+	if (result.code != ResultCode::Error)
+		result = buildDraws();
+	if (result.code == ResultCode::Error)
+		return result;
+	_scene->loadHierarchy();
+	return Result::ok();
+}
+
+bool SceneDescriptor::canUpdate() const {
+	return _isLoaded && _incremental;
+}
+
+Result SceneDescriptor::placeGeometry() {
+	using Key			= std::pair<const void*, uint64_t>;
+	const auto keyOf	= [](const GeometryView& view) { return Key{view.shared.get(), view.mesh}; };
+
+	// What the scene holds now, and what of it is not on the GPU yet.
+	struct Added {
+		Key key;
+		std::shared_ptr<const ModelMesh> shared;
+		const std::vector<Vertex>* vertices;
+		const std::vector<VertexSkin>* skin;
+		std::vector<const std::vector<uint32_t>*> indices;
+	};
+	std::map<Key, bool> present;
+	std::vector<Added>	added;
+	_scene->placeGeometry([&](const GeometryView& view) {
+		const Key key = keyOf(view);
+		if (present.emplace(key, true).second && _geometry.find(key) == _geometry.end())
+			added.push_back({key, view.shared, &view.vertices, &view.skin, view.indices});
+		return GeometryPlacement{};
 	});
 
-	// Materials no draw uses yet get an id too: an asset may switch to one of them later
-	// (Asset::setMaterialOverride()) without anything being rebuilt.
-	for (const auto& [name, material] : _scene->getMaterials()) {
-		if (materialIds.find(name) != materialIds.end())
+	// What left gives its room back first, so that what came may take it.
+	size_t removed = 0;
+	for (auto it = _geometry.begin(); it != _geometry.end();) {
+		if (present.count(it->first)) {
+			++it;
 			continue;
-		materialIds[name] = static_cast<uint32_t>(materialTextureNames.size());
-		materialTextureNames.push_back(materialTextureName(material));
-		materialColors.push_back(materialColor(material));
-		materialEmissions.push_back(materialEmission(material));
-	}
-	_uploadedMaterialIds = perDrawMaterialIds;
-
-	if (matrices.empty())
-		matrices.push_back(mat4::identity());
-
-	_resources.modelMatrixBuffer = renderApi::createStorageBuffer(_resources.gpu, matrices, renderApi::BufferUsage::DYNAMIC);
-	if (!_resources.modelMatrixBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create model matrix buffer");
-
-	_resources.drawCount = static_cast<uint32_t>(drawCommands.size());
-	// Showing or hiding an asset changes its instance count: see SharedGpuResources::drawCommands.
-	if (!_resources.createDrawCommands(drawCommands.data(), drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to create draw commands buffer");
-
-	_resources.perDrawBuffer = renderApi::createStorageBuffer(
-		_resources.gpu, std::max<size_t>(1, perDrawMaterialIds.size() * sizeof(uint32_t)), renderApi::BufferUsage::DYNAMIC);
-	if (!_resources.perDrawBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create per-draw buffer");
-	if (!perDrawMaterialIds.empty() && !_resources.perDrawBuffer.upload(
-			perDrawMaterialIds.data(), perDrawMaterialIds.size() * sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload per-draw data");
-
-
-	{
-		std::vector<uint32_t> drawInfos;
-		_uploadedBones = collectBones(*_scene, &drawInfos);
-		if (drawInfos.empty())
-			drawInfos.push_back(0);
-
-		_resources.boneBuffer = renderApi::createStorageBuffer(_resources.gpu, _uploadedBones, renderApi::BufferUsage::DYNAMIC);
-		_resources.drawInfoBuffer = renderApi::createStorageBuffer(_resources.gpu, drawInfos, renderApi::BufferUsage::DYNAMIC);
-		if (!_resources.boneBuffer.isValid() || !_resources.drawInfoBuffer.isValid())
-			return Result::error("SceneDescriptor '" + _name + "': failed to create bone buffers");
+		}
+		_vertexRanges.release(it->second.firstVertex, it->second.vertexCount);
+		for (const auto& [first, count] : it->second.indexRanges)
+			_indexRanges.release(first, count);
+		it = _geometry.erase(it);
+		++removed;
 	}
 
+	// Room for what came, the allocators growing when they must; the buffers follow below.
+	struct Upload {
+		uint32_t firstVertex;
+		const std::vector<Vertex>* vertices;
+		const std::vector<VertexSkin>* skin;
+		std::vector<std::pair<uint32_t, const std::vector<uint32_t>*>> indices;
+	};
+	std::vector<Upload> uploads;
+	uploads.reserve(added.size());
+	for (Added& piece : added) {
+		GeometryRanges ranges;
+		ranges.shared	   = std::move(piece.shared);
+		ranges.vertexCount = static_cast<uint32_t>(piece.vertices->size());
+		ranges.firstVertex = take(_vertexRanges, ranges.vertexCount);
+		Upload upload{ranges.firstVertex, piece.vertices, piece.skin, {}};
+		for (const std::vector<uint32_t>* list : piece.indices) {
+			uint32_t first = 0;
+			const auto same = std::find_if(upload.indices.begin(), upload.indices.end(), [&](const auto& placed) { return placed.second == list; });
+			if (same != upload.indices.end()) {
+				first = same->first;
+			} else {
+				const auto count = static_cast<uint32_t>(list->size());
+				first			 = take(_indexRanges, count);
+				ranges.indexRanges.push_back({first, count});
+				upload.indices.push_back({first, list});
+			}
+			ranges.firstIndex.push_back(first);
+		}
+		uploads.push_back(std::move(upload));
+		_geometry.emplace(piece.key, std::move(ranges));
+	}
+
+	if (!growBuffer(_resources.gpu, _resources.vertexBuffer, size_t(_vertexRanges.capacity()) * sizeof(Vertex), renderApi::BufferType::VERTEX) ||
+		!growBuffer(_resources.gpu, _resources.skinBuffer, size_t(_vertexRanges.capacity()) * sizeof(VertexSkin), renderApi::BufferType::VERTEX) ||
+		!growBuffer(_resources.gpu, _resources.indexBuffer, size_t(_indexRanges.capacity()) * sizeof(uint32_t), renderApi::BufferType::INDEX))
+		return Result::error("SceneDescriptor '" + _name + "': failed to grow the geometry buffers");
+
+	UploadBatch batch;
+	for (const Upload& upload : uploads) {
+		const size_t count = upload.vertices->size();
+		batch.add(_resources.vertexBuffer, size_t(upload.firstVertex) * sizeof(Vertex), upload.vertices->data(), count * sizeof(Vertex));
+		// Zeros for what is not skinned.
+		batch.add(_resources.skinBuffer, size_t(upload.firstVertex) * sizeof(VertexSkin), upload.skin->size() == count ? upload.skin->data() : nullptr,
+				  count * sizeof(VertexSkin));
+		for (const auto& [first, list] : upload.indices)
+			batch.add(_resources.indexBuffer, size_t(first) * sizeof(uint32_t), list->data(), list->size() * sizeof(uint32_t));
+	}
+	if (!batch.submit(_resources.gpu))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the new geometry");
+
+	// Every piece is on the GPU now: the scene learns where.
+	_scene->placeGeometry([&](const GeometryView& view) {
+		const GeometryRanges& ranges = _geometry.at(keyOf(view));
+		return GeometryPlacement{ranges.firstVertex, ranges.firstIndex};
+	});
+
+	_resources.vertexCount = 0;
+	_resources.indexCount  = 0;
+	for (const auto& [key, ranges] : _geometry) {
+		_resources.vertexCount += ranges.vertexCount;
+		for (const auto& [first, count] : ranges.indexRanges)
+			_resources.indexCount += count;
+	}
+	if (_isLoaded && (!added.empty() || removed > 0))
+		std::cout << "SceneDescriptor '" << _name << "': " << added.size() << " pieces of geometry added, " << removed << " removed ("
+				  << _resources.vertexCount << " of " << _vertexRanges.capacity() << " vertices used)" << std::endl;
+	return Result::ok();
+}
+
+Result SceneDescriptor::updateMaterials() {
+	// The image textures the scene got since the last time; texture 0 is what materials without
+	// any albedo sample: the first file texture, else white.
 	loadTextures();
-	// Texture 0 is what materials without any albedo sample: the first file texture, else white.
 	Result fallbackResult = ensureFallbackTexture();
 	if (fallbackResult.code == ResultCode::Error)
 		return fallbackResult;
 
+	// Ids are kept: materials are only added. Those no draw uses yet get one too, so that an asset
+	// may switch to one of them later (Asset::setMaterialOverride()) without anything being rebuilt.
+	const auto add = [&](const Material& material) {
+		if (_materialIds.find(material.name) != _materialIds.end())
+			return;
+		_materialIds[material.name] = static_cast<uint32_t>(_materialSources.size());
+		_materialSources.push_back({materialTextureName(material), materialColor(material), materialEmission(material)});
+	};
+	_scene->forEachSubMesh([&](const DrawCallView& drawCall) { add(drawCall.material); });
+	for (const auto& [name, material] : _scene->getMaterials())
+		add(material);
+
 	// The shaders only sample textures: a flat color is a 1x1 texture, shared by the materials using it.
-	std::unordered_map<uint32_t, uint32_t> colorTextures;
 	std::vector<uint32_t> materialData;
-	materialData.reserve(materialTextureNames.size());
-	for (size_t i = 0; i < materialTextureNames.size(); ++i) {
-		const std::string& texName = materialTextureNames[i];
+	materialData.reserve(_materialSources.size());
+	for (const MaterialSource& source : _materialSources) {
 		uint32_t textureIndex = 0;
-		auto it = _textureIndexMap.find(texName);
-		if (!texName.empty() && it != _textureIndexMap.end()) {
+		const auto it		  = _textureIndexMap.find(source.texture);
+		if (!source.texture.empty() && it != _textureIndexMap.end()) {
 			textureIndex = it->second;
-		} else if (materialColors[i]) {
+		} else if (source.color) {
 			const auto channel = [](float value) {
 				return static_cast<uint32_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
 			};
-			const vec3& color = *materialColors[i];
+			const vec3& color = *source.color;
 			// Alpha is the opposite of the emission: stylized graphs read it (RenderGraphConfig::toon()),
 			// the default one ignores it.
 			const uint32_t pixel = channel(color.x) | (channel(color.y) << 8) | (channel(color.z) << 16) |
-								   (channel(1.0f - materialEmissions[i]) << 24);
+								   (channel(1.0f - source.emission) << 24);
 
-			auto colorIt = colorTextures.find(pixel);
-			if (colorIt != colorTextures.end()) {
+			auto colorIt = _colorTextures.find(pixel);
+			if (colorIt != _colorTextures.end()) {
 				textureIndex = colorIt->second;
 			} else if (_resources.textures.size() < kMaxSceneTextures) {
 				renderApi::Texture colorTex = renderApi::createTexture2D(
@@ -273,7 +415,8 @@ Result SceneDescriptor::loadFromScene() {
 				if (colorTex.isValid()) {
 					textureIndex = static_cast<uint32_t>(_resources.textures.size());
 					_resources.textures.push_back(std::move(colorTex));
-					colorTextures[pixel] = textureIndex;
+					_textureIdentities.push_back("");
+					_colorTextures[pixel] = textureIndex;
 				}
 			}
 		}
@@ -282,22 +425,71 @@ Result SceneDescriptor::loadFromScene() {
 	if (materialData.empty())
 		materialData.push_back(0);
 
-	_resources.materialBuffer = renderApi::createStorageBuffer(
-		_resources.gpu, materialData.size() * sizeof(uint32_t));
-	if (!_resources.materialBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create material buffer");
-	if (!_resources.materialBuffer.upload(materialData.data(), materialData.size() * sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload material data");
+	const size_t bytes = materialData.size() * sizeof(uint32_t);
+	if (!ensureRoom(_resources.gpu, _resources.materialBuffer, bytes, renderApi::BufferType::STORAGE, renderApi::BufferUsage::STATIC) ||
+		!_resources.materialBuffer.upload(materialData.data(), bytes))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the materials");
+	return Result::ok();
+}
 
-	_scene->loadHierarchy();
+Result SceneDescriptor::buildDraws() {
+	// Everything per draw is made again: it is small, and the draws come in the order of the
+	// assets, which an asset added or removed changes.
+	std::vector<VkDrawIndexedIndirectCommand>& drawCommands = _drawCommands;
+	drawCommands.clear();
+	_drawVisible.clear();
+	std::vector<mat4>	  matrices;
+	std::vector<uint32_t> perDrawMaterialIds;
+	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
+		matrices.push_back(drawCallMatrix(drawCall));
+		const auto it = _materialIds.find(drawCall.material.name);
+		perDrawMaterialIds.push_back(it != _materialIds.end() ? it->second : 0);
 
-	_isLoaded = true;
-	std::cout << "SceneDescriptor '" << _name << "': loaded ("
-		  << _resources.vertexCount << " vertices, "
-		  << _resources.indexCount << " indices, "
-		  << _resources.drawCount << " draws, "
-		  << materialData.size() << " materials, "
-		  << _resources.textures.size() << " textures)" << std::endl;
+		VkDrawIndexedIndirectCommand cmd{};
+		cmd.indexCount	  = drawCall.indecesCount;
+		cmd.instanceCount = drawCall.visible ? 1 : 0; // a hidden draw costs nothing: see syncModelMatrices()
+		cmd.firstIndex	  = drawCall.indicesIndex;
+		cmd.vertexOffset  = static_cast<int32_t>(drawCall.verticesIndex);
+		cmd.firstInstance = 0;
+		drawCommands.push_back(cmd);
+		_drawVisible.push_back(drawCall.visible);
+	});
+	_uploadedMaterialIds = perDrawMaterialIds;
+	_uploadedMatrices	 = matrices;
+	if (matrices.empty())
+		matrices.push_back(mat4::identity());
+
+	using renderApi::BufferType;
+	using renderApi::BufferUsage;
+	renderApi::device::GPU* gpu = _resources.gpu;
+	if (!ensureRoom(gpu, _resources.modelMatrixBuffer, matrices.size() * sizeof(mat4), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
+		!_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4)))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the model matrices");
+
+	if (!ensureRoom(gpu, _resources.perDrawBuffer, perDrawMaterialIds.size() * sizeof(uint32_t), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
+		(!perDrawMaterialIds.empty() && !_resources.perDrawBuffer.upload(perDrawMaterialIds.data(), perDrawMaterialIds.size() * sizeof(uint32_t))))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the per-draw data");
+
+	std::vector<uint32_t> drawInfos;
+	_uploadedBones = collectBones(*_scene, &drawInfos);
+	if (drawInfos.empty())
+		drawInfos.push_back(0);
+	if (!ensureRoom(gpu, _resources.boneBuffer, _uploadedBones.size() * sizeof(mat4), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
+		!_resources.boneBuffer.upload(_uploadedBones.data(), _uploadedBones.size() * sizeof(mat4)) ||
+		!ensureRoom(gpu, _resources.drawInfoBuffer, drawInfos.size() * sizeof(uint32_t), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
+		!_resources.drawInfoBuffer.upload(drawInfos.data(), drawInfos.size() * sizeof(uint32_t)))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the bones");
+
+	// The ring of draw lists keeps its room; it is only made again, larger, when the list outgrows it.
+	const size_t commandBytes = drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand);
+	const bool	 fits		  = _resources.drawCommandsBuffer().isValid() && _resources.drawCommandsBuffer().getSize() >= commandBytes;
+	if (!fits) {
+		if (!_resources.createDrawCommands(drawCommands.data(), commandBytes, commandBytes + commandBytes / 2))
+			return Result::error("SceneDescriptor '" + _name + "': failed to create the draw commands");
+	} else if (commandBytes > 0 && !_resources.setDrawCommands(drawCommands.data(), commandBytes)) {
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the draw commands");
+	}
+	_resources.drawCount = static_cast<uint32_t>(drawCommands.size());
 	return Result::ok();
 }
 
@@ -504,8 +696,8 @@ Result SceneDescriptor::loadTextures() {
 	if (!_scene)
 		return Result::ok();
 
-	_textureIndexMap.clear();
-	_textureIdentities.assign(_resources.textures.size(), "");
+	// One identity per texture of _resources, "" for what is not an image (a flat color, the fallback).
+	_textureIdentities.resize(_resources.textures.size());
 
 	// What the last load kept and this one does not take back is no longer used.
 	struct DropUnused {
@@ -523,8 +715,11 @@ Result SceneDescriptor::loadTextures() {
 
 	// The same image under several names (a model added to another one copies its textures, the
 	// same file taken by two models) is uploaded once: the shaders hold kMaxSceneTextures at most.
-	std::unordered_map<std::string, uint32_t> sameImage;
+	// Only what is not on the GPU yet is looked at: textures are never removed from a scene.
+	std::unordered_map<std::string, uint32_t>& sameImage = _sameImage;
 	for (const auto& [key, tex] : sceneTextures) {
+		if (_textureIndexMap.find(key) != _textureIndexMap.end())
+			continue;
 		std::string identity;
 		if (const auto* encoded = std::get_if<Texture::Encoded>(&tex.data)) {
 			uint64_t hash = 1469598103934665603ull;
@@ -540,6 +735,7 @@ Result SceneDescriptor::loadTextures() {
 		}
 		if (_resources.textures.size() >= kMaxSceneTextures) {
 			std::cerr << "SceneDescriptor '" << _name << "': more than " << kMaxSceneTextures << " textures, '" << key << "' left out" << std::endl;
+			_textureIndexMap[key] = 0; // the fallback, and not tried again
 			continue;
 		}
 		if (const auto kept = _keptTextures.find(identity); !identity.empty() && kept != _keptTextures.end()) {
@@ -569,6 +765,7 @@ Result SceneDescriptor::loadTextures() {
 		if (!pixels) {
 			std::cerr << "SceneDescriptor '" << _name << "': failed to load texture '"
 					  << source << "' (" << stbi_failure_reason() << ")" << std::endl;
+			_textureIndexMap[key] = 0;
 			continue;
 		}
 
@@ -609,6 +806,7 @@ Result SceneDescriptor::loadTextures() {
 		if (!gpuTex.isValid()) {
 			std::cerr << "SceneDescriptor '" << _name << "': failed to create GPU texture '"
 					  << source << "'" << std::endl;
+			_textureIndexMap[key] = 0;
 			continue;
 		}
 
@@ -635,6 +833,7 @@ Result SceneDescriptor::ensureFallbackTexture() {
 	if (!whiteTex.isValid())
 		return Result::error("SceneDescriptor '" + _name + "': failed to create default texture");
 	_resources.textures.push_back(std::move(whiteTex));
+	_textureIdentities.push_back("");
 	return Result::ok();
 }
 
@@ -656,7 +855,16 @@ Result SceneDescriptor::unloadScene(bool keepTextures) {
 				_keptTextures[_textureIdentities[i]] = std::move(_resources.textures[i]);
 	_textureIdentities.clear();
 	_resources.destroy();
-	_isLoaded = false;
+	_geometry.clear();
+	_vertexRanges.reset(0);
+	_indexRanges.reset(0);
+	_textureIndexMap.clear();
+	_sameImage.clear();
+	_colorTextures.clear();
+	_materialIds.clear();
+	_materialSources.clear();
+	_isLoaded	 = false;
+	_incremental = false;
 	std::cout << "SceneDescriptor '" << _name << "': unloaded" << std::endl;
 	return Result::ok();
 }
