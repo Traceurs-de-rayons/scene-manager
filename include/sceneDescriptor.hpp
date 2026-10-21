@@ -45,15 +45,23 @@ class SceneDescriptor {
 		RangeAllocator					_indexRanges;
 		bool							_incremental = false; // built by loadFromScene(): update() keeps it current
 
-		// The materials, by id (_materialIds): what their texture is made of.
+		// The materials, by id (_materialIds): what their textures are made of and the numbers
+		// they are multiplied by. See SceneDescriptor::updateMaterials().
 		struct MaterialSource {
-			std::string			texture;		 // name of an image texture of the scene, or empty
-			std::optional<vec3>	color;			 // flat albedo, when there is no texture
-			float				emission = 0.0f; // 0..1
+			std::string albedoTexture; // name of an image texture of the scene, or empty
+			std::string normalTexture; // its blue channel is the normal map (tangent space)
+			std::string ormTexture;	   // red = occlusion, green = roughness, blue = metallic
+			vec3  tint{1.0f};		   // multiplied with the albedo (a texture, or the color)
+			float roughness = 1.0f, metallic = 0.0f, occlusion = 1.0f;
+			float normalIntensity = 1.0f;
+			float uvScale		  = 1.0f;  // tiles per world unit (1 / Material::texture_scale)
+			vec3  emission{0.0f};		   // color of what the surface gives off
+			float emissionStrength = 0.0f; // 0..1, the "how lit" of the stylized graphs
+			bool  cutout		   = false; // what the alpha of the albedo hides is not drawn at all
+			float alphaCutoff	   = 0.5f;
 		};
-		std::vector<MaterialSource>		_materialSources;
-		std::unordered_map<std::string, uint32_t> _sameImage;	  // image identity -> its texture: the same image under several names
-		std::unordered_map<uint32_t, uint32_t>	  _colorTextures; // RGBA of a flat color -> its 1x1 texture
+		std::vector<MaterialSource>				  _materialSources;
+		std::unordered_map<std::string, uint32_t> _sameImage; // image identity -> its texture: the same image under several names
 
 		Result	loadFromScene();
 		Result	loadFallbackPyramid();

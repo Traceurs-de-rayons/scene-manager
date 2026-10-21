@@ -73,6 +73,23 @@ static std::string materialTextureName(const Material& material) {
 	return "";
 }
 
+// The image a field of a material points at, empty when the field holds a number instead.
+static std::string textureNameOf(const std::optional<MaterialParam<float>>& param) {
+	if (param && std::holds_alternative<std::string>(param->value))
+		return std::get<std::string>(param->value);
+	return "";
+}
+
+// The number a field holds (or the factor of the texture it names, or `fallback`): what the
+// texture is multiplied by, so a material that gives only a number needs no image at all.
+static float factorOf(const std::optional<MaterialParam<float>>& param, const std::optional<float>& factor, float fallback) {
+	if (param && std::holds_alternative<float>(param->value))
+		return std::get<float>(param->value);
+	if (factor)
+		return *factor;
+	return fallback;
+}
+
 // The shaders (RowMajor, mul(M, v)) expect model matrices transposed relative to
 // cu::math's column-vector convention used by Transform::getMatrix().
 static mat4 transposeMatrix(const mat4& m) {
@@ -215,7 +232,6 @@ Result SceneDescriptor::loadFromScene() {
 	_indexRanges.reset(indexRoom);
 	_textureIndexMap.clear();
 	_sameImage.clear();
-	_colorTextures.clear();
 	_materialIds.clear();
 	_materialSources.clear();
 	_textureIdentities.clear();
@@ -369,12 +385,54 @@ Result SceneDescriptor::placeGeometry() {
 }
 
 Result SceneDescriptor::updateMaterials() {
-	// The image textures the scene got since the last time; texture 0 is what materials without
-	// any albedo sample: the first file texture, else white.
-	loadTextures();
+	// Texture 0 is white: what a material without an image samples (its tint is then its color),
+	// and what an image that failed to load falls back to. It comes first so that it stays 0.
 	Result fallbackResult = ensureFallbackTexture();
 	if (fallbackResult.code == ResultCode::Error)
 		return fallbackResult;
+	// The image textures the scene got since the last time.
+	loadTextures();
+
+	// Everything a material says, in the terms of the shaders. What the scene gives as numbers
+	// needs no image: the fallback texture (white, and a flat normal) leaves them as they are.
+	const auto describe = [](const Material& material) {
+		MaterialSource source;
+
+		// Albedo: an image, or a color (which the white fallback leaves untouched).
+		if (const auto color = materialColor(material))
+			source.tint = *color;
+		source.albedoTexture = materialTextureName(material);
+		if (material.albedo_factor)
+			source.tint = source.tint * *material.albedo_factor;
+
+		source.normalTexture   = material.normal_map ? *material.normal_map : "";
+		source.normalIntensity = material.normal_intensity ? *material.normal_intensity : 1.0f;
+
+		// Metallic, roughness and occlusion share one image, the way glTF packs them (red =
+		// occlusion, green = roughness, blue = metallic): the first of the three that names a
+		// texture is the one that holds all of them.
+		const std::string occlusion = textureNameOf(material.ambient_occlusion);
+		const std::string roughness = textureNameOf(material.roughness);
+		const std::string metallic  = textureNameOf(material.metallic);
+		source.ormTexture			= !occlusion.empty() ? occlusion : (!roughness.empty() ? roughness : metallic);
+		source.occlusion			= factorOf(material.ambient_occlusion, material.occlusion_factor, 1.0f);
+		source.roughness			= factorOf(material.roughness, material.roughness_factor, 1.0f);
+		source.metallic				= factorOf(material.metallic, material.metallic_factor, 0.0f);
+
+		if (material.emission_color && std::holds_alternative<vec3>(material.emission_color->value))
+			source.emission = std::get<vec3>(material.emission_color->value);
+		source.emissionStrength = materialEmission(material);
+
+		source.cutout = material.alpha_mode && *material.alpha_mode == "cutout";
+		if (material.alpha_cutoff)
+			source.alphaCutoff = *material.alpha_cutoff;
+
+		// The map gives its geometry UVs in metres: a material saying how many metres one tile
+		// covers turns that into the tiles per metre the shader multiplies the UVs by.
+		if (material.texture_scale && *material.texture_scale > 0.0f)
+			source.uvScale = 1.0f / *material.texture_scale;
+		return source;
+	};
 
 	// Ids are kept: materials are only added. Those no draw uses yet get one too, so that an asset
 	// may switch to one of them later (Asset::setMaterialOverride()) without anything being rebuilt.
@@ -382,50 +440,55 @@ Result SceneDescriptor::updateMaterials() {
 		if (_materialIds.find(material.name) != _materialIds.end())
 			return;
 		_materialIds[material.name] = static_cast<uint32_t>(_materialSources.size());
-		_materialSources.push_back({materialTextureName(material), materialColor(material), materialEmission(material)});
+		_materialSources.push_back(describe(material));
 	};
 	_scene->forEachSubMesh([&](const DrawCallView& drawCall) { add(drawCall.material); });
 	for (const auto& [name, material] : _scene->getMaterials())
 		add(material);
 
-	// The shaders only sample textures: a flat color is a 1x1 texture, shared by the materials using it.
-	std::vector<uint32_t> materialData;
+	// The layout mirrors GpuMaterial in raster-core/shaders/geometry.frag.slang: four rows of
+	// four 32-bit values, so both sides read the same bytes.
+	struct GpuMaterial {
+		float	 tint[4];	  // rgb = albedo tint, a = tiles per world unit
+		float	 params[4];	  // roughness, metallic, occlusion, normal intensity
+		float	 emission[4]; // rgb = color, a = strength
+		uint32_t textures[4]; // albedo, normal, orm, flags
+	};
+	static_assert(sizeof(GpuMaterial) == 64, "the shaders read 64 bytes per material");
+
+	const auto textureIndex = [&](const std::string& name) {
+		if (name.empty())
+			return 0u;
+		const auto it = _textureIndexMap.find(name);
+		return it != _textureIndexMap.end() ? it->second : 0u;
+	};
+
+	std::vector<GpuMaterial> materialData;
 	materialData.reserve(_materialSources.size());
 	for (const MaterialSource& source : _materialSources) {
-		uint32_t textureIndex = 0;
-		const auto it		  = _textureIndexMap.find(source.texture);
-		if (!source.texture.empty() && it != _textureIndexMap.end()) {
-			textureIndex = it->second;
-		} else if (source.color) {
-			const auto channel = [](float value) {
-				return static_cast<uint32_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
-			};
-			const vec3& color = *source.color;
-			// Alpha is the opposite of the emission: stylized graphs read it (RenderGraphConfig::toon()),
-			// the default one ignores it.
-			const uint32_t pixel = channel(color.x) | (channel(color.y) << 8) | (channel(color.z) << 16) |
-								   (channel(1.0f - source.emission) << 24);
-
-			auto colorIt = _colorTextures.find(pixel);
-			if (colorIt != _colorTextures.end()) {
-				textureIndex = colorIt->second;
-			} else if (_resources.textures.size() < kMaxSceneTextures) {
-				renderApi::Texture colorTex = renderApi::createTexture2D(
-					_resources.gpu, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, &pixel, sizeof(pixel), false);
-				if (colorTex.isValid()) {
-					textureIndex = static_cast<uint32_t>(_resources.textures.size());
-					_resources.textures.push_back(std::move(colorTex));
-					_textureIdentities.push_back("");
-					_colorTextures[pixel] = textureIndex;
-				}
-			}
-		}
-		materialData.push_back(textureIndex);
+		GpuMaterial material{};
+		material.tint[0] = source.tint.x;
+		material.tint[1] = source.tint.y;
+		material.tint[2] = source.tint.z;
+		material.tint[3] = source.uvScale;
+		material.params[0] = source.roughness;
+		material.params[1] = source.metallic;
+		material.params[2] = source.occlusion;
+		material.params[3] = source.normalIntensity;
+		material.emission[0] = source.emission.x;
+		material.emission[1] = source.emission.y;
+		material.emission[2] = source.emission.z;
+		material.emission[3] = source.emissionStrength;
+		material.textures[0] = textureIndex(source.albedoTexture);
+		material.textures[1] = textureIndex(source.normalTexture);
+		material.textures[2] = textureIndex(source.ormTexture);
+		material.textures[3] = (source.normalTexture.empty() ? 0u : 1u) | (source.ormTexture.empty() ? 0u : 2u) | (source.cutout ? 4u : 0u);
+		materialData.push_back(material);
 	}
 	if (materialData.empty())
-		materialData.push_back(0);
+		materialData.push_back(GpuMaterial{});
 
-	const size_t bytes = materialData.size() * sizeof(uint32_t);
+	const size_t bytes = materialData.size() * sizeof(GpuMaterial);
 	if (!ensureRoom(_resources.gpu, _resources.materialBuffer, bytes, renderApi::BufferType::STORAGE, renderApi::BufferUsage::STATIC) ||
 		!_resources.materialBuffer.upload(materialData.data(), bytes))
 		return Result::error("SceneDescriptor '" + _name + "': failed to upload the materials");
@@ -860,7 +923,6 @@ Result SceneDescriptor::unloadScene(bool keepTextures) {
 	_indexRanges.reset(0);
 	_textureIndexMap.clear();
 	_sameImage.clear();
-	_colorTextures.clear();
 	_materialIds.clear();
 	_materialSources.clear();
 	_isLoaded	 = false;
