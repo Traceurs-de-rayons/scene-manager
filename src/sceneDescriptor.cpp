@@ -1,22 +1,21 @@
-#include <unordered_map>
-#include <optional>
-#include <algorithm>
 #include "sceneDescriptor.hpp"
 #include "Scene.hpp"
-#include "Vertex.hpp"
-#include "renderApi.hpp"
 #include "buffer.hpp"
 #include "image.hpp"
 #include "return.hpp"
+#include "sceneManager.hpp"
 #include "stb_image.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
-SceneDescriptor::SceneDescriptor(std::string name, Scene* scene, renderApi::device::GPU* gpu)
-		: _name(std::move(name)), _scene(scene) {
+SceneDescriptor::SceneDescriptor(std::string name, Scene* scene, renderApi::device::GPU* gpu, SceneManager* manager)
+		: _name(std::move(name)), _scene(scene), _manager(manager) {
 	_resources.gpu = gpu;
 }
 
@@ -24,34 +23,7 @@ SceneDescriptor::~SceneDescriptor() {
 	unloadScene();
 }
 
-Result SceneDescriptor::loadScene() {
-	// New geometry: whatever was rendered from the previous one (cached shadow maps) is stale.
-	++_resources.geometryVersion;
-	_uploadedMatrices.clear();
-
-	if (_isLoaded)
-		return Result::ok();
-
-	if (!_resources.gpu)
-		return Result::error("SceneDescriptor '" + _name + "': no GPU set");
-
-	if (!_scene)
-		return Result::error("SceneDescriptor '" + _name + "': no scene set");
-
-	_loadedStructureVersion = _scene->getStructureVersion();
-
-	if (_scene->getVertexAmount() == 0 || _scene->getIndexAmount() == 0) {
-		std::cout << "SceneDescriptor '" << _name << "': empty scene, loading fallback pyramid" << std::endl;
-		return loadFallbackPyramid();
-	}
-
-	return loadFromScene();
-}
-
-
-// Size of the texture array of geometry.frag.
 static constexpr size_t kMaxSceneTextures = 128;
-// Largest width or height a scene texture is uploaded with.
 static constexpr int kMaxTextureSize = 2048;
 
 static std::optional<vec3> materialColor(const Material& material) {
@@ -60,7 +32,6 @@ static std::optional<vec3> materialColor(const Material& material) {
 	return std::nullopt;
 }
 
-// 0 = plain surface, 1 = fully emissive.
 static float materialEmission(const Material& material) {
 	if (material.emission_strength && std::holds_alternative<float>(material.emission_strength->value))
 		return std::clamp(std::get<float>(material.emission_strength->value), 0.0f, 1.0f);
@@ -72,16 +43,12 @@ static std::string materialTextureName(const Material& material) {
 		return std::get<std::string>(material.albedo->value);
 	return "";
 }
-
-// The image a field of a material points at, empty when the field holds a number instead.
 static std::string textureNameOf(const std::optional<MaterialParam<float>>& param) {
 	if (param && std::holds_alternative<std::string>(param->value))
 		return std::get<std::string>(param->value);
 	return "";
 }
 
-// The number a field holds (or the factor of the texture it names, or `fallback`): what the
-// texture is multiplied by, so a material that gives only a number needs no image at all.
 static float factorOf(const std::optional<MaterialParam<float>>& param, const std::optional<float>& factor, float fallback) {
 	if (param && std::holds_alternative<float>(param->value))
 		return std::get<float>(param->value);
@@ -90,8 +57,6 @@ static float factorOf(const std::optional<MaterialParam<float>>& param, const st
 	return fallback;
 }
 
-// The shaders (RowMajor, mul(M, v)) expect model matrices transposed relative to
-// cu::math's column-vector convention used by Transform::getMatrix().
 static mat4 transposeMatrix(const mat4& m) {
 	mat4 r(0.0f);
 	for (int row = 0; row < 4; ++row)
@@ -100,105 +65,13 @@ static mat4 transposeMatrix(const mat4& m) {
 	return r;
 }
 
-// Hidden draws get a null matrix: every vertex collapses to one point, so nothing is rasterized
-// (main pass and shadow maps alike) and the draw list stays untouched.
 static mat4 drawCallMatrix(const DrawCallView& drawCall) {
 	if (!drawCall.visible)
 		return mat4(0.0f);
 	return transposeMatrix(drawCall.transform.getMatrix());
 }
 
-// Bone matrices of every skinned draw, one pose after the other, in the layout the shaders
-// expect. `firstBones`, when given, receives the drawInfoBuffer entry of each draw.
-static std::vector<mat4> collectBones(const Scene& scene, std::vector<uint32_t>* drawInfos = nullptr) {
-	std::vector<mat4> bones;
-	std::unordered_map<const std::vector<mat4>*, uint32_t> firstBones; // sub meshes of one asset share its pose
-
-	scene.forEachSubMesh([&](const DrawCallView& drawCall) {
-		uint32_t first = 0;
-		if (drawCall.bones) {
-			auto it = firstBones.find(drawCall.bones);
-			if (it == firstBones.end()) {
-				first = static_cast<uint32_t>(bones.size());
-				firstBones[drawCall.bones] = first;
-				for (const mat4& bone : *drawCall.bones)
-					bones.push_back(transposeMatrix(bone));
-			} else {
-				first = it->second;
-			}
-		}
-		if (drawInfos)
-			drawInfos->push_back(first | (drawCall.viewModel ? RasterCore::SharedGpuResources::kViewModelBit : 0u));
-	});
-
-	if (bones.empty())
-		bones.push_back(mat4::identity());
-	return bones;
-}
-
 namespace {
-
-	// Copies into GPU buffers, gathered in one staging buffer and sent in one submission.
-	class UploadBatch {
-		private:
-			struct Copy {
-				VkBuffer	 target;
-				VkDeviceSize offset;
-				VkDeviceSize from;
-				VkDeviceSize size;
-			};
-			std::vector<uint8_t> _bytes;
-			std::vector<Copy>	 _copies;
-
-		public:
-			// `size` bytes of `data` (zeros when it is null) at `offset` of `target`.
-			void add(const renderApi::Buffer& target, size_t offset, const void* data, size_t size) {
-				if (size == 0)
-					return;
-				const size_t from = _bytes.size();
-				_bytes.resize(from + size);
-				if (data)
-					std::memcpy(_bytes.data() + from, data, size);
-				else
-					std::memset(_bytes.data() + from, 0, size);
-				_copies.push_back({target.getHandle(), offset, from, size});
-			}
-
-			bool submit(renderApi::device::GPU* gpu) {
-				if (_copies.empty())
-					return true;
-				renderApi::Buffer staging = renderApi::createStagingBuffer(gpu, _bytes.size());
-				void*			  to	  = staging.isValid() ? staging.map() : nullptr;
-				if (!to)
-					return false;
-				std::memcpy(to, _bytes.data(), _bytes.size());
-				staging.unmap();
-				VkCommandBuffer cmd = gpu->beginOneTimeCommands();
-				for (const Copy& copy : _copies) {
-					const VkBufferCopy region{copy.from, copy.offset, copy.size};
-					vkCmdCopyBuffer(cmd, staging.getHandle(), copy.target, 1, &region);
-				}
-				gpu->endOneTimeCommands(cmd); // waits for the copies
-				return true;
-			}
-	};
-
-	// A device buffer of `bytes`, holding what `buffer` held: made larger only when it is too small.
-	bool growBuffer(renderApi::device::GPU* gpu, renderApi::Buffer& buffer, size_t bytes, renderApi::BufferType type) {
-		if (buffer.isValid() && buffer.getSize() >= bytes)
-			return true;
-		renderApi::Buffer larger;
-		if (!larger.create(gpu, std::max<size_t>(bytes, 16), type, renderApi::BufferUsage::STATIC))
-			return false;
-		if (buffer.isValid() && buffer.getSize() > 0) {
-			VkCommandBuffer	   cmd = gpu->beginOneTimeCommands();
-			const VkBufferCopy region{0, 0, buffer.getSize()};
-			vkCmdCopyBuffer(cmd, buffer.getHandle(), larger.getHandle(), 1, &region);
-			gpu->endOneTimeCommands(cmd);
-		}
-		buffer = std::move(larger);
-		return true;
-	}
 
 	// Room for at least `bytes`: made again, half as large again, only when it is too small (what
 	// it held is lost: the caller writes it all).
@@ -213,174 +86,322 @@ namespace {
 		return true;
 	}
 
-	// Where `count` free elements are, the allocator grown (at least doubled) when it has no such room.
-	uint32_t take(RangeAllocator& ranges, uint32_t count) {
-		if (const auto first = ranges.allocate(count))
-			return *first;
-		ranges.grow(std::max(ranges.capacity() * 2, ranges.capacity() + count));
-		return *ranges.allocate(count);
-	}
-
 }
 
-Result SceneDescriptor::loadFromScene() {
-	// Room for the scene and some more: assets added later go there, nothing is made again.
-	const uint32_t vertices = _scene->getVertexAmount(), indices = _scene->getIndexAmount();
-	const uint32_t vertexRoom = vertices + vertices / 4 + 4096, indexRoom = indices + indices / 4 + 12288;
-	_geometry.clear();
-	_vertexRanges.reset(vertexRoom);
-	_indexRanges.reset(indexRoom);
+Result SceneDescriptor::loadScene() {
+	++_resources.geometryVersion;
+
+	if (_isLoaded)
+		return Result::ok();
+
+	if (!_resources.gpu)
+		return Result::error("SceneDescriptor '" + _name + "': no GPU set");
+
+	if (!_scene)
+		return Result::error("SceneDescriptor '" + _name + "': no scene set");
+
+	if (!_manager)
+		return Result::error("SceneDescriptor '" + _name + "': no scene manager set");
+
+	// From nothing: every asset of the scene is added (an empty scene loads too: no draw).
 	_textureIndexMap.clear();
 	_sameImage.clear();
 	_materialIds.clear();
 	_materialSources.clear();
 	_textureIdentities.clear();
+	_syncedVersion = ~0ull;
 
-	_resources.vertexBuffer = renderApi::createVertexBuffer<Vertex>(_resources.gpu, vertexRoom);
-	_resources.skinBuffer	= renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, vertexRoom);
-	_resources.indexBuffer	= renderApi::createIndexBuffer<uint32_t>(_resources.gpu, indexRoom);
-	if (!_resources.vertexBuffer.isValid() || !_resources.skinBuffer.isValid() || !_resources.indexBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create the geometry buffers");
-
-	Result result = update();
+	bool   changed = false;
+	Result result  = sync(changed);
+	if (result.code != ResultCode::Error)
+		result = _manager->flushUploads();
+	if (result.code != ResultCode::Error)
+		result = commit(false);
 	if (result.code == ResultCode::Error)
 		return result;
+	_manager->freeReleased();
 
-	_isLoaded	 = true;
-	_incremental = true;
+	_isLoaded = true;
 	std::cout << "SceneDescriptor '" << _name << "': loaded ("
-		  << _resources.vertexCount << " vertices, "
-		  << _resources.indexCount << " indices, "
+		  << _assets.size() << " assets, "
+		  << _manager->loadedMeshes() << " meshes on the GPU, "
 		  << _resources.drawCount << " draws, "
 		  << _materialSources.size() << " materials, "
 		  << _resources.textures.size() << " textures)" << std::endl;
 	return Result::ok();
 }
 
-Result SceneDescriptor::update() {
-	if (!_scene || !_resources.gpu)
-		return Result::error("SceneDescriptor '" + _name + "': no scene or GPU to update from");
+uint32_t SceneDescriptor::takeSlot() {
+	if (!_freeSlots.empty()) {
+		const uint32_t slot = _freeSlots.back();
+		_freeSlots.pop_back();
+		return slot;
+	}
+	const auto slot = static_cast<uint32_t>(_slots.size());
+	_slots.emplace_back();
+	_matrices.push_back(mat4(0.0f));
+	_materials.push_back(0);
+	_drawInfos.push_back(0);
+	_geometry.emplace_back();
+	_commands.push_back(VkDrawIndirectCommand{0, 0, 0, slot});
+	return slot;
+}
 
-	// New geometry: whatever was rendered from the previous one (cached shadow maps) is stale.
-	++_resources.geometryVersion;
-	_loadedStructureVersion = _scene->getStructureVersion();
+void SceneDescriptor::writeGeometry(uint32_t slot) {
+	const Slot& drawn = _slots[slot];
+	if (drawn.mesh == kNoMesh) {
+		_geometry[slot]			   = {};
+		_commands[slot].vertexCount = 0;
+		return;
+	}
+	_geometry[slot] = {_manager->meshVertices(drawn.mesh), _manager->meshSkin(drawn.mesh), _manager->meshIndices(drawn.mesh, drawn.list), 0};
+	// Not indexed: vertex n of the draw is the one its index n names (shaders/scene_vertex.slang).
+	// Its first instance is its slot: the row the shaders read.
+	_commands[slot].vertexCount	  = _manager->meshIndexCount(drawn.mesh, drawn.list);
+	_commands[slot].firstVertex	  = 0;
+	_commands[slot].firstInstance = slot;
+}
 
-	Result result = placeGeometry();
-	if (result.code != ResultCode::Error)
-		result = updateMaterials();
-	if (result.code != ResultCode::Error)
-		result = buildDraws();
-	if (result.code == ResultCode::Error)
-		return result;
-	_scene->loadHierarchy();
+Result SceneDescriptor::addAsset(const std::string& name) {
+	if (!_scene || !_manager)
+		return Result::error("SceneDescriptor '" + _name + "': no scene or scene manager");
+	if (_assets.count(name))
+		return Result::ok();
+
+	// Its meshes, each with the index lists of its sub meshes (they may share one), and the draws.
+	struct Draw {
+		size_t	 mesh;
+		uint32_t list;
+	};
+	AssetSlots			  asset;
+	std::vector<MeshData> meshes;
+	std::vector<Draw>	  draws;
+	_scene->forEachSubMesh(name, [&](const DrawCallView& drawCall) {
+		asset.geometry.push_back(drawCall.geometry);
+		if (meshes.empty() || meshes.back().key != drawCall.geometry)
+			meshes.push_back({drawCall.geometry, drawCall.owner ? *drawCall.owner : nullptr, drawCall.vertices, drawCall.skin, {}});
+		std::vector<const std::vector<uint32_t>*>& lists = meshes.back().indices;
+		auto list = std::find(lists.begin(), lists.end(), drawCall.indices);
+		if (list == lists.end())
+			list = lists.insert(lists.end(), drawCall.indices);
+		draws.push_back({meshes.size() - 1, static_cast<uint32_t>(list - lists.begin())});
+	});
+	if (draws.empty())
+		return Result::ok(); // not an object (a light, a camera): nothing to draw
+
+	for (const MeshData& mesh : meshes) {
+		const MeshId id = _manager->loadMesh(mesh);
+		if (id == kNoMesh) {
+			for (const MeshId loaded : asset.meshes)
+				_manager->unloadMesh(loaded);
+			return Result::error("SceneDescriptor '" + _name + "': no GPU memory left for the geometry of '" + name + "'");
+		}
+		asset.meshes.push_back(id);
+	}
+	for (const Draw& draw : draws) {
+		const uint32_t slot = takeSlot();
+		_slots[slot]		= {asset.meshes[draw.mesh], draw.list};
+		writeGeometry(slot);
+		asset.slots.push_back(slot);
+	}
+	_assets.emplace(name, std::move(asset));
 	return Result::ok();
 }
 
-bool SceneDescriptor::canUpdate() const {
-	return _isLoaded && _incremental;
+void SceneDescriptor::removeAsset(const std::string& name) {
+	const auto it = _assets.find(name);
+	if (it == _assets.end())
+		return;
+	for (const uint32_t slot : it->second.slots) {
+		_slots[slot] = {};
+		writeGeometry(slot);
+		_commands[slot].instanceCount = 0;
+		_matrices[slot]				  = mat4(0.0f);
+		_freeSlots.push_back(slot);
+	}
+	for (const MeshId mesh : it->second.meshes)
+		_manager->unloadMesh(mesh);
+	_assets.erase(it);
 }
 
-Result SceneDescriptor::placeGeometry() {
-	using Key			= std::pair<const void*, uint64_t>;
-	const auto keyOf	= [](const GeometryView& view) { return Key{view.shared.get(), view.mesh}; };
+bool SceneDescriptor::needsReload() const {
+	return _isLoaded && _scene && _scene->getStructureVersion() != _syncedVersion;
+}
 
-	// What the scene holds now, and what of it is not on the GPU yet.
-	struct Added {
-		Key key;
-		std::shared_ptr<const ModelMesh> shared;
-		const std::vector<Vertex>* vertices;
-		const std::vector<VertexSkin>* skin;
-		std::vector<const std::vector<uint32_t>*> indices;
-	};
-	std::map<Key, bool> present;
-	std::vector<Added>	added;
-	_scene->placeGeometry([&](const GeometryView& view) {
-		const Key key = keyOf(view);
-		if (present.emplace(key, true).second && _geometry.find(key) == _geometry.end())
-			added.push_back({key, view.shared, &view.vertices, &view.skin, view.indices});
-		return GeometryPlacement{};
+Result SceneDescriptor::sync(bool& changed) {
+	changed = false;
+	if (!_scene || _scene->getStructureVersion() == _syncedVersion)
+		return Result::ok();
+
+	// What the scene holds now: the geometry of each asset, in the order of its sub meshes, and
+	// the asset of each sub mesh of the scene (the order the rows are read in each frame).
+	std::unordered_map<std::string, std::vector<GeometryKey>> now;
+	std::vector<std::pair<const std::string*, uint32_t>>	   order;
+	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
+		std::vector<GeometryKey>& geometry = now[*drawCall.asset];
+		order.push_back({drawCall.asset, static_cast<uint32_t>(geometry.size())});
+		geometry.push_back(drawCall.geometry);
 	});
 
-	// What left gives its room back first, so that what came may take it.
-	size_t removed = 0;
-	for (auto it = _geometry.begin(); it != _geometry.end();) {
-		if (present.count(it->first)) {
-			++it;
+	// What left, or is made of something else now, goes; what came is added.
+	std::vector<std::string> gone;
+	for (const auto& [name, asset] : _assets)
+		if (const auto it = now.find(name); it == now.end() || it->second != asset.geometry)
+			gone.push_back(name);
+	for (const std::string& name : gone)
+		removeAsset(name);
+	size_t added = 0;
+	for (const auto& [name, geometry] : now) {
+		if (_assets.count(name))
 			continue;
+		if (const Result result = addAsset(name); result.code == ResultCode::Error)
+			return result;
+		++added;
+	}
+	if (_isLoaded)
+		std::cout << "SceneDescriptor '" << _name << "': " << added << " assets added, " << gone.size() << " removed (" << _manager->loadedMeshes()
+				  << " meshes on the GPU)" << std::endl;
+
+	_slotOrder.clear();
+	_slotOrder.reserve(order.size());
+	for (const auto& [asset, index] : order)
+		_slotOrder.push_back(_assets.at(*asset).slots[index]);
+	_syncedVersion = _scene->getStructureVersion();
+	changed		   = true;
+	return Result::ok();
+}
+
+void SceneDescriptor::readScene(bool upload) {
+	if (!_scene || _slotOrder.empty())
+		return;
+
+	// Bones: the poses of the skinned assets one after the other (the sub meshes of an asset share
+	// its pose), each draw pointing at the first of its own.
+	std::vector<mat4>									   bones;
+	std::unordered_map<const std::vector<mat4>*, uint32_t> firstBones;
+	bool matrices = false, materials = false, infos = false, commands = false;
+	size_t draw = 0;
+	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
+		if (draw >= _slotOrder.size())
+			return;
+		const uint32_t slot = _slotOrder[draw++];
+
+		const mat4 matrix = drawCallMatrix(drawCall);
+		if (std::memcmp(&matrix, &_matrices[slot], sizeof(mat4)) != 0) {
+			_matrices[slot] = matrix;
+			matrices		= true;
 		}
-		_vertexRanges.release(it->second.firstVertex, it->second.vertexCount);
-		for (const auto& [first, count] : it->second.indexRanges)
-			_indexRanges.release(first, count);
-		it = _geometry.erase(it);
-		++removed;
-	}
 
-	// Room for what came, the allocators growing when they must; the buffers follow below.
-	struct Upload {
-		uint32_t firstVertex;
-		const std::vector<Vertex>* vertices;
-		const std::vector<VertexSkin>* skin;
-		std::vector<std::pair<uint32_t, const std::vector<uint32_t>*>> indices;
-	};
-	std::vector<Upload> uploads;
-	uploads.reserve(added.size());
-	for (Added& piece : added) {
-		GeometryRanges ranges;
-		ranges.shared	   = std::move(piece.shared);
-		ranges.vertexCount = static_cast<uint32_t>(piece.vertices->size());
-		ranges.firstVertex = take(_vertexRanges, ranges.vertexCount);
-		Upload upload{ranges.firstVertex, piece.vertices, piece.skin, {}};
-		for (const std::vector<uint32_t>* list : piece.indices) {
-			uint32_t first = 0;
-			const auto same = std::find_if(upload.indices.begin(), upload.indices.end(), [&](const auto& placed) { return placed.second == list; });
-			if (same != upload.indices.end()) {
-				first = same->first;
-			} else {
-				const auto count = static_cast<uint32_t>(list->size());
-				first			 = take(_indexRanges, count);
-				ranges.indexRanges.push_back({first, count});
-				upload.indices.push_back({first, list});
-			}
-			ranges.firstIndex.push_back(first);
+		const auto	   material = _materialIds.find(drawCall.material.name);
+		const uint32_t id		= material != _materialIds.end() ? material->second : 0;
+		if (id != _materials[slot]) {
+			_materials[slot] = id;
+			materials		 = true;
 		}
-		uploads.push_back(std::move(upload));
-		_geometry.emplace(piece.key, std::move(ranges));
-	}
 
-	if (!growBuffer(_resources.gpu, _resources.vertexBuffer, size_t(_vertexRanges.capacity()) * sizeof(Vertex), renderApi::BufferType::VERTEX) ||
-		!growBuffer(_resources.gpu, _resources.skinBuffer, size_t(_vertexRanges.capacity()) * sizeof(VertexSkin), renderApi::BufferType::VERTEX) ||
-		!growBuffer(_resources.gpu, _resources.indexBuffer, size_t(_indexRanges.capacity()) * sizeof(uint32_t), renderApi::BufferType::INDEX))
-		return Result::error("SceneDescriptor '" + _name + "': failed to grow the geometry buffers");
+		uint32_t first = 0;
+		if (drawCall.bones) {
+			const auto [it, added] = firstBones.try_emplace(drawCall.bones, static_cast<uint32_t>(bones.size()));
+			if (added)
+				for (const mat4& bone : *drawCall.bones)
+					bones.push_back(transposeMatrix(bone));
+			first = it->second;
+		}
+		const uint32_t info = first | (drawCall.viewModel ? RasterCore::SharedGpuResources::kViewModelBit : 0u);
+		if (info != _drawInfos[slot]) {
+			_drawInfos[slot] = info;
+			infos			 = true;
+		}
 
-	UploadBatch batch;
-	for (const Upload& upload : uploads) {
-		const size_t count = upload.vertices->size();
-		batch.add(_resources.vertexBuffer, size_t(upload.firstVertex) * sizeof(Vertex), upload.vertices->data(), count * sizeof(Vertex));
-		// Zeros for what is not skinned.
-		batch.add(_resources.skinBuffer, size_t(upload.firstVertex) * sizeof(VertexSkin), upload.skin->size() == count ? upload.skin->data() : nullptr,
-				  count * sizeof(VertexSkin));
-		for (const auto& [first, list] : upload.indices)
-			batch.add(_resources.indexBuffer, size_t(first) * sizeof(uint32_t), list->data(), list->size() * sizeof(uint32_t));
-	}
-	if (!batch.submit(_resources.gpu))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload the new geometry");
-
-	// Every piece is on the GPU now: the scene learns where.
-	_scene->placeGeometry([&](const GeometryView& view) {
-		const GeometryRanges& ranges = _geometry.at(keyOf(view));
-		return GeometryPlacement{ranges.firstVertex, ranges.firstIndex};
+		// A hidden draw is taken out of the list (no instance): its vertices are not even read.
+		const uint32_t instances = drawCall.visible && _commands[slot].vertexCount > 0 ? 1 : 0;
+		if (instances != _commands[slot].instanceCount) {
+			_commands[slot].instanceCount = instances;
+			commands					  = true;
+		}
 	});
+	if (bones.empty())
+		bones.push_back(mat4::identity());
+	const bool posed = bones.size() != _bones.size() || std::memcmp(bones.data(), _bones.data(), bones.size() * sizeof(mat4)) != 0;
+	if (posed)
+		_bones = std::move(bones);
 
-	_resources.vertexCount = 0;
-	_resources.indexCount  = 0;
-	for (const auto& [key, ranges] : _geometry) {
-		_resources.vertexCount += ranges.vertexCount;
-		for (const auto& [first, count] : ranges.indexRanges)
-			_resources.indexCount += count;
+	if (!upload)
+		return; // commit() sends everything
+	// In place: the rows are only read by the frames, and the draw list goes into the next buffer
+	// of its ring. More bones than their buffer holds (an asset posed for the first time): neither
+	// they nor the rows pointing into them go now, or the shaders would read past the end of the
+	// buffer (the GPU hangs); commit() makes it larger, under the lock, and sends both.
+	const bool bonesFit = _resources.boneBuffer.isValid() && _resources.boneBuffer.getSize() >= _bones.size() * sizeof(mat4);
+	if (!bonesFit && (posed || infos))
+		_commitWanted = true;
+	if (matrices)
+		_resources.modelMatrixBuffer.upload(_matrices.data(), _matrices.size() * sizeof(mat4));
+	if (materials)
+		_resources.perDrawBuffer.upload(_materials.data(), _materials.size() * sizeof(uint32_t));
+	if (infos && bonesFit)
+		_resources.drawInfoBuffer.upload(_drawInfos.data(), _drawInfos.size() * sizeof(uint32_t));
+	if (posed && bonesFit)
+		_resources.boneBuffer.upload(_bones.data(), _bones.size() * sizeof(mat4));
+	if (commands)
+		_resources.setDrawCommands(_commands.data(), _commands.size() * sizeof(VkDrawIndirectCommand));
+	if (matrices || commands || (posed && bonesFit))
+		++_resources.geometryVersion;
+}
+
+void SceneDescriptor::syncModelMatrices() {
+	// Rows follow the order of the sub meshes, which only holds for the assets sync() saw.
+	if (!_isLoaded || needsReload())
+		return;
+	readScene(true);
+}
+
+Result SceneDescriptor::commit(bool geometryMoved) {
+	if (!_scene || !_resources.gpu)
+		return Result::error("SceneDescriptor '" + _name + "': no scene or GPU to commit to");
+
+	if (geometryMoved)
+		for (uint32_t slot = 0; slot < _slots.size(); ++slot)
+			writeGeometry(slot);
+
+	Result result = updateMaterials();
+	if (result.code == ResultCode::Error)
+		return result;
+	readScene(false);
+
+	// Every per draw buffer, made larger when the slots outgrew it (then bound again by the
+	// viewports: Viewport::refreshSceneBindings()).
+	using renderApi::BufferType;
+	using renderApi::BufferUsage;
+	renderApi::device::GPU* gpu	  = _resources.gpu;
+	const auto				write = [&](renderApi::Buffer& buffer, const void* data, size_t bytes) {
+		 return ensureRoom(gpu, buffer, bytes, BufferType::STORAGE, BufferUsage::DYNAMIC) && (bytes == 0 || buffer.upload(data, bytes));
+	};
+	if (!write(_resources.modelMatrixBuffer, _matrices.data(), _matrices.size() * sizeof(mat4)) ||
+		!write(_resources.perDrawBuffer, _materials.data(), _materials.size() * sizeof(uint32_t)) ||
+		!write(_resources.drawInfoBuffer, _drawInfos.data(), _drawInfos.size() * sizeof(uint32_t)) ||
+		!write(_resources.drawGeometryBuffer, _geometry.data(), _geometry.size() * sizeof(GeometryRow)) ||
+		!write(_resources.boneBuffer, _bones.data(), _bones.size() * sizeof(mat4)))
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the per draw buffers");
+
+	// The ring of draw lists keeps its room; it is only made again, larger, when the list outgrows it.
+	const size_t commandBytes = _commands.size() * sizeof(VkDrawIndirectCommand);
+	const bool	 fits		  = _resources.drawCommandsBuffer().isValid() && _resources.drawCommandsBuffer().getSize() >= commandBytes;
+	if (!fits) {
+		if (!_resources.createDrawCommands(_commands.data(), commandBytes, commandBytes + commandBytes / 2))
+			return Result::error("SceneDescriptor '" + _name + "': failed to create the draw commands");
+	} else if (commandBytes > 0 && !_resources.setDrawCommands(_commands.data(), commandBytes)) {
+		return Result::error("SceneDescriptor '" + _name + "': failed to upload the draw commands");
 	}
-	if (_isLoaded && (!added.empty() || removed > 0))
-		std::cout << "SceneDescriptor '" << _name << "': " << added.size() << " pieces of geometry added, " << removed << " removed ("
-				  << _resources.vertexCount << " of " << _vertexRanges.capacity() << " vertices used)" << std::endl;
+	_resources.drawCount  = static_cast<uint32_t>(_commands.size());
+	_resources.indexCount = 0;
+	for (const VkDrawIndirectCommand& command : _commands)
+		_resources.indexCount += command.vertexCount;
+
+	// New geometry: whatever was rendered from the previous one (cached shadow maps) is stale.
+	++_resources.geometryVersion;
+	_commitWanted = false;
+	_scene->loadHierarchy();
 	return Result::ok();
 }
 
@@ -495,137 +516,6 @@ Result SceneDescriptor::updateMaterials() {
 	return Result::ok();
 }
 
-Result SceneDescriptor::buildDraws() {
-	// Everything per draw is made again: it is small, and the draws come in the order of the
-	// assets, which an asset added or removed changes.
-	std::vector<VkDrawIndexedIndirectCommand>& drawCommands = _drawCommands;
-	drawCommands.clear();
-	_drawVisible.clear();
-	std::vector<mat4>	  matrices;
-	std::vector<uint32_t> perDrawMaterialIds;
-	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-		matrices.push_back(drawCallMatrix(drawCall));
-		const auto it = _materialIds.find(drawCall.material.name);
-		perDrawMaterialIds.push_back(it != _materialIds.end() ? it->second : 0);
-
-		VkDrawIndexedIndirectCommand cmd{};
-		cmd.indexCount	  = drawCall.indecesCount;
-		cmd.instanceCount = drawCall.visible ? 1 : 0; // a hidden draw costs nothing: see syncModelMatrices()
-		cmd.firstIndex	  = drawCall.indicesIndex;
-		cmd.vertexOffset  = static_cast<int32_t>(drawCall.verticesIndex);
-		cmd.firstInstance = 0;
-		drawCommands.push_back(cmd);
-		_drawVisible.push_back(drawCall.visible);
-	});
-	_uploadedMaterialIds = perDrawMaterialIds;
-	_uploadedMatrices	 = matrices;
-	if (matrices.empty())
-		matrices.push_back(mat4::identity());
-
-	using renderApi::BufferType;
-	using renderApi::BufferUsage;
-	renderApi::device::GPU* gpu = _resources.gpu;
-	if (!ensureRoom(gpu, _resources.modelMatrixBuffer, matrices.size() * sizeof(mat4), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
-		!_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload the model matrices");
-
-	if (!ensureRoom(gpu, _resources.perDrawBuffer, perDrawMaterialIds.size() * sizeof(uint32_t), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
-		(!perDrawMaterialIds.empty() && !_resources.perDrawBuffer.upload(perDrawMaterialIds.data(), perDrawMaterialIds.size() * sizeof(uint32_t))))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload the per-draw data");
-
-	std::vector<uint32_t> drawInfos;
-	_uploadedBones = collectBones(*_scene, &drawInfos);
-	if (drawInfos.empty())
-		drawInfos.push_back(0);
-	if (!ensureRoom(gpu, _resources.boneBuffer, _uploadedBones.size() * sizeof(mat4), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
-		!_resources.boneBuffer.upload(_uploadedBones.data(), _uploadedBones.size() * sizeof(mat4)) ||
-		!ensureRoom(gpu, _resources.drawInfoBuffer, drawInfos.size() * sizeof(uint32_t), BufferType::STORAGE, BufferUsage::DYNAMIC) ||
-		!_resources.drawInfoBuffer.upload(drawInfos.data(), drawInfos.size() * sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload the bones");
-
-	// The ring of draw lists keeps its room; it is only made again, larger, when the list outgrows it.
-	const size_t commandBytes = drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand);
-	const bool	 fits		  = _resources.drawCommandsBuffer().isValid() && _resources.drawCommandsBuffer().getSize() >= commandBytes;
-	if (!fits) {
-		if (!_resources.createDrawCommands(drawCommands.data(), commandBytes, commandBytes + commandBytes / 2))
-			return Result::error("SceneDescriptor '" + _name + "': failed to create the draw commands");
-	} else if (commandBytes > 0 && !_resources.setDrawCommands(drawCommands.data(), commandBytes)) {
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload the draw commands");
-	}
-	_resources.drawCount = static_cast<uint32_t>(drawCommands.size());
-	return Result::ok();
-}
-
-void SceneDescriptor::syncModelMatrices() {
-	if (!_scene || !_resources.modelMatrixBuffer.isValid())
-		return;
-
-	std::vector<mat4> matrices;
-	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-		matrices.push_back(drawCallMatrix(drawCall));
-	});
-
-	if (matrices.empty())
-		return;
-
-	// Nothing moved: the buffers and everything rendered from them are still valid.
-	bool changed = false;
-	if (matrices.size() != _uploadedMatrices.size() ||
-		std::memcmp(matrices.data(), _uploadedMatrices.data(), matrices.size() * sizeof(mat4)) != 0) {
-		_resources.modelMatrixBuffer.upload(matrices.data(), matrices.size() * sizeof(mat4));
-		_uploadedMatrices = std::move(matrices);
-		changed = true;
-	}
-
-	// Poses: the set of skinned draws only changes with a reload, so the size always matches.
-	if (_resources.boneBuffer.isValid()) {
-		std::vector<mat4> bones = collectBones(*_scene);
-		if (bones.size() == _uploadedBones.size() &&
-			std::memcmp(bones.data(), _uploadedBones.data(), bones.size() * sizeof(mat4)) != 0) {
-			_resources.boneBuffer.upload(bones.data(), bones.size() * sizeof(mat4));
-			_uploadedBones = std::move(bones);
-			changed = true;
-		}
-	}
-
-	// Visibility: a hidden asset is taken out of the draw list (instance count 0), so its
-	// vertices are not even processed. Its null matrix only covers the frame in between.
-	if (_resources.drawCommandsBuffer().isValid() && !_drawCommands.empty()) {
-		std::vector<bool> visible;
-		visible.reserve(_drawVisible.size());
-		_scene->forEachSubMesh([&](const DrawCallView& drawCall) { visible.push_back(drawCall.visible); });
-		if (visible.size() == _drawVisible.size() && visible != _drawVisible) {
-			for (size_t i = 0; i < visible.size(); ++i)
-				_drawCommands[i].instanceCount = visible[i] ? 1 : 0;
-			// Into another buffer than the one the frames in flight read (see SharedGpuResources).
-			_resources.setDrawCommands(_drawCommands.data(), _drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand));
-			_drawVisible = std::move(visible);
-			changed		 = true;
-		}
-	}
-
-	// Materials: an asset may have switched to another one of the scene.
-	if (_resources.perDrawBuffer.isValid() && !_uploadedMaterialIds.empty()) {
-		std::vector<uint32_t> ids;
-		ids.reserve(_uploadedMaterialIds.size());
-		_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
-			const auto it = _materialIds.find(drawCall.material.name);
-			ids.push_back(it != _materialIds.end() ? it->second : 0);
-		});
-		if (ids.size() == _uploadedMaterialIds.size() && ids != _uploadedMaterialIds) {
-			_resources.perDrawBuffer.upload(ids.data(), ids.size() * sizeof(uint32_t));
-			_uploadedMaterialIds = std::move(ids);
-		}
-	}
-
-	if (changed)
-		++_resources.geometryVersion;
-}
-
-bool SceneDescriptor::needsReload() const {
-	return _isLoaded && _scene && _scene->getStructureVersion() != _loadedStructureVersion;
-}
-
 void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 	if (!_scene)
 		return;
@@ -672,87 +562,6 @@ void SceneDescriptor::collectLights(std::vector<RasterCore::Light>& out) const {
 		}
 		out.push_back(light);
 	}
-}
-
-Result SceneDescriptor::loadFallbackPyramid() {
-	std::vector<Vertex> vertices = {
-		{{-0.5f, 0.0f, -0.5f}, {0.0f, -1.0f, 0.0f}, {0.0f, 0.0f}},
-		{{ 0.5f, 0.0f, -0.5f}, {0.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},
-		{{ 0.5f, 0.0f,  0.5f}, {0.0f, -1.0f, 0.0f}, {1.0f, 1.0f}},
-		{{-0.5f, 0.0f,  0.5f}, {0.0f, -1.0f, 0.0f}, {0.0f, 1.0f}},
-		{{ 0.0f, 1.0f,  0.0f}, {0.0f,  1.0f, 0.0f}, {0.5f, 0.5f}},
-	};
-
-	std::vector<uint32_t> indices = {
-		0, 2, 1,  0, 3, 2,
-		0, 1, 4,
-		1, 2, 4,
-		2, 3, 4,
-		3, 0, 4,
-	};
-
-	std::vector<mat4> matrices = { mat4::identity() };
-
-	_resources.vertexCount = static_cast<uint32_t>(vertices.size());
-	_resources.indexCount = static_cast<uint32_t>(indices.size());
-
-	_resources.vertexBuffer = renderApi::createVertexBuffer<Vertex>(_resources.gpu, _resources.vertexCount);
-	if (!_resources.vertexBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create vertex buffer");
-	if (!_resources.vertexBuffer.upload(vertices.data(), vertices.size() * sizeof(Vertex)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload vertices");
-
-	_resources.indexBuffer = renderApi::createIndexBuffer<uint32_t>(_resources.gpu, _resources.indexCount);
-	if (!_resources.indexBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create index buffer");
-	if (!_resources.indexBuffer.upload(indices.data(), indices.size() * sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload indices");
-
-	_resources.modelMatrixBuffer = renderApi::createStorageBuffer(_resources.gpu, matrices, renderApi::BufferUsage::DYNAMIC);
-	if (!_resources.modelMatrixBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create model matrix buffer");
-
-	// Nothing is skinned, but the shaders still read these.
-	const std::vector<VertexSkin> skins(vertices.size());
-	const std::vector<uint32_t>	  drawInfos = {0};
-	_resources.skinBuffer = renderApi::createVertexBuffer<VertexSkin>(_resources.gpu, _resources.vertexCount);
-	_resources.boneBuffer = renderApi::createStorageBuffer(_resources.gpu, matrices, renderApi::BufferUsage::DYNAMIC);
-	_resources.drawInfoBuffer = renderApi::createStorageBuffer(_resources.gpu, drawInfos, renderApi::BufferUsage::DYNAMIC);
-	if (!_resources.skinBuffer.isValid() || !_resources.boneBuffer.isValid() || !_resources.drawInfoBuffer.isValid() ||
-		!_resources.skinBuffer.upload(skins.data(), skins.size() * sizeof(VertexSkin)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to create skinning buffers");
-
-	VkDrawIndexedIndirectCommand cmd{};
-	cmd.indexCount    = _resources.indexCount;
-	cmd.instanceCount = 1;
-	cmd.firstIndex    = 0;
-	cmd.vertexOffset  = 0;
-	cmd.firstInstance = 0;
-
-	_resources.drawCount = 1;
-	if (!_resources.createDrawCommands(&cmd, sizeof(cmd)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to create draw commands buffer");
-
-	const uint32_t zero = 0;
-	_resources.perDrawBuffer = renderApi::createStorageBuffer(_resources.gpu, sizeof(uint32_t));
-	if (!_resources.perDrawBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create per-draw buffer");
-	if (!_resources.perDrawBuffer.upload(&zero, sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload per-draw data");
-
-	_resources.materialBuffer = renderApi::createStorageBuffer(_resources.gpu, sizeof(uint32_t));
-	if (!_resources.materialBuffer.isValid())
-		return Result::error("SceneDescriptor '" + _name + "': failed to create material buffer");
-	if (!_resources.materialBuffer.upload(&zero, sizeof(uint32_t)))
-		return Result::error("SceneDescriptor '" + _name + "': failed to upload material data");
-
-	Result texResult = ensureFallbackTexture();
-	if (texResult.code == ResultCode::Error)
-		return texResult;
-
-	_isLoaded = true;
-	std::cout << "SceneDescriptor '" << _name << "': fallback pyramid loaded" << std::endl;
-	return Result::ok();
 }
 
 Result SceneDescriptor::loadTextures() {
@@ -906,11 +715,20 @@ Result SceneDescriptor::unloadScene(bool keepTextures) {
 			texture.destroy();
 		_keptTextures.clear();
 	}
-	if (!_isLoaded)
+	if (!_isLoaded && _assets.empty())
 		return Result::ok();
 
 	if (_resources.gpu)
 		vkDeviceWaitIdle(_resources.gpu->device);
+
+	// Nothing draws any more: the meshes are unloaded, their cells free at once.
+	std::vector<std::string> names;
+	for (const auto& [name, asset] : _assets)
+		names.push_back(name);
+	for (const std::string& name : names)
+		removeAsset(name);
+	if (_manager)
+		_manager->freeReleased();
 
 	if (keepTextures)
 		for (size_t i = 0; i < _resources.textures.size() && i < _textureIdentities.size(); ++i)
@@ -918,15 +736,21 @@ Result SceneDescriptor::unloadScene(bool keepTextures) {
 				_keptTextures[_textureIdentities[i]] = std::move(_resources.textures[i]);
 	_textureIdentities.clear();
 	_resources.destroy();
+	_slots.clear();
+	_freeSlots.clear();
+	_matrices.clear();
+	_materials.clear();
+	_drawInfos.clear();
 	_geometry.clear();
-	_vertexRanges.reset(0);
-	_indexRanges.reset(0);
+	_commands.clear();
+	_bones.clear();
+	_slotOrder.clear();
 	_textureIndexMap.clear();
 	_sameImage.clear();
 	_materialIds.clear();
 	_materialSources.clear();
-	_isLoaded	 = false;
-	_incremental = false;
+	_syncedVersion = ~0ull;
+	_isLoaded	   = false;
 	std::cout << "SceneDescriptor '" << _name << "': unloaded" << std::endl;
 	return Result::ok();
 }
