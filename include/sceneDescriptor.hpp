@@ -11,71 +11,61 @@
 
 class SceneManager;
 
-// The GPU side of a scene: one slot per draw (a sub mesh of an asset), a row of each per draw
-// buffer (matrix, material, addresses of its geometry, bones, draw command). The geometry
-// itself is loaded by the scene manager (SceneManager::loadMesh()), once for every draw sharing it.
 class SceneDescriptor {
 	private:
 		std::string						_name;
 		Scene*							_scene	 = nullptr;
-		SceneManager*					_manager = nullptr; // loads and unloads the meshes
+		SceneManager*					_manager = nullptr;
 		RasterCore::SharedGpuResources	_resources;
 		bool							_isLoaded = false;
-		uint64_t						_syncedVersion = ~0ull; // Scene::getStructureVersion() the slots were made from (none yet)
+		uint64_t						_syncedVersion = ~0ull;
 
-		// The slots. A free one draws nothing (its command has no vertex) until it is taken again.
 		struct Slot {
 			MeshId	 mesh = kNoMesh;
-			uint32_t list = 0; // index list of the mesh
+			uint32_t list = 0;
 		};
-		// What a row of drawGeometryBuffer holds (DrawGeometry in shaders/scene_vertex.slang).
+
 		struct GeometryRow {
 			VkDeviceAddress vertices = 0, skin = 0, indices = 0, unused = 0;
 		};
 		std::vector<Slot>					   _slots;
 		std::vector<uint32_t>				   _freeSlots;
-		std::vector<mat4>					   _matrices;  // the rows of each buffer, by slot, as uploaded
+		std::vector<mat4>					   _matrices;
 		std::vector<uint32_t>				   _materials;
 		std::vector<uint32_t>				   _drawInfos;
 		std::vector<GeometryRow>			   _geometry;
 		std::vector<VkDrawIndirectCommand>	   _commands;
 		std::vector<mat4>					   _bones;
-		bool								   _commitWanted = false; // the rows outgrew a buffer outside a sync(): commit() must send them
+		bool								   _commitWanted = false;
 
-		// The assets drawn: their meshes and their slots, in the order Scene::forEachSubMesh() gives
-		// their sub meshes. `geometry` is what the asset was made of: when it changes, the asset
-		// is removed and added again.
 		struct AssetSlots {
 			std::vector<GeometryKey> geometry;
 			std::vector<MeshId>		 meshes;
 			std::vector<uint32_t>	 slots;
 		};
 		std::unordered_map<std::string, AssetSlots> _assets;
-		std::vector<uint32_t>						_slotOrder; // the slot of each sub mesh of the scene, in the order of Scene::forEachSubMesh()
+		std::vector<uint32_t>						_slotOrder;
 
-		// Textures and materials: only added (see updateMaterials()).
 		std::unordered_map<std::string, uint32_t> _textureIndexMap;
 		std::vector<std::string>		_textureIdentities;
 		std::unordered_map<std::string, renderApi::Texture> _keptTextures;
 		std::unordered_map<std::string, uint32_t> _materialIds;
 
-		// The materials, by id (_materialIds): what their textures are made of and the numbers
-		// they are multiplied by. See SceneDescriptor::updateMaterials().
 		struct MaterialSource {
-			std::string albedoTexture; // name of an image texture of the scene, or empty
-			std::string normalTexture; // its blue channel is the normal map (tangent space)
-			std::string ormTexture;	   // red = occlusion, green = roughness, blue = metallic
-			vec3  tint{1.0f};		   // multiplied with the albedo (a texture, or the color)
+			std::string albedoTexture;
+			std::string normalTexture;
+			std::string ormTexture;
+			vec3  tint{1.0f};
 			float roughness = 1.0f, metallic = 0.0f, occlusion = 1.0f;
 			float normalIntensity = 1.0f;
-			float uvScale		  = 1.0f;  // tiles per world unit (1 / Material::texture_scale)
-			vec3  emission{0.0f};		   // color of what the surface gives off
-			float emissionStrength = 0.0f; // 0..1, the "how lit" of the stylized graphs
-			bool  cutout		   = false; // what the alpha of the albedo hides is not drawn at all
+			float uvScale		  = 1.0f;
+			vec3  emission{0.0f};
+			float emissionStrength = 0.0f;
+			bool  cutout		   = false;
 			float alphaCutoff	   = 0.5f;
 		};
 		std::vector<MaterialSource>				  _materialSources;
-		std::unordered_map<std::string, uint32_t> _sameImage; // image identity -> its texture: the same image under several names
+		std::unordered_map<std::string, uint32_t> _sameImage;
 
 		Result	loadTextures();
 		Result	ensureFallbackTexture();
