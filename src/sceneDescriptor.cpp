@@ -275,13 +275,25 @@ void SceneDescriptor::readScene(bool upload) {
 	if (!_scene || _slotOrder.empty())
 		return;
 
-	// Bones: the poses of the skinned assets one after the other (the sub meshes of an asset share
-	// its pose), each draw pointing at the first of its own.
+	// Bones: the poses of the skinned assets shown one after the other (the sub meshes of an asset
+	// share its pose), each draw pointing at the first of its own.
 	std::vector<mat4>									   bones;
 	std::unordered_map<const std::vector<mat4>*, uint32_t> firstBones;
 	bool matrices = false, materials = false, infos = false, commands = false;
 	size_t draw = 0;
-	_scene->forEachSubMesh([&](const DrawCallView& drawCall) {
+	// A hidden asset is only taken out of the draw list: its matrix, material and bones are left
+	// as they were, and compared again when it shows (a scene keeps many hidden: every player
+	// slot of the game is made up front).
+	const auto hidden = [&](size_t count) {
+		for (size_t i = 0; i < count && draw < _slotOrder.size(); ++i) {
+			const uint32_t slot = _slotOrder[draw++];
+			if (_commands[slot].instanceCount != 0) {
+				_commands[slot].instanceCount = 0;
+				commands					  = true;
+			}
+		}
+	};
+	const auto visible = [&](const DrawCallView& drawCall) {
 		if (draw >= _slotOrder.size())
 			return;
 		const uint32_t slot = _slotOrder[draw++];
@@ -319,7 +331,8 @@ void SceneDescriptor::readScene(bool upload) {
 			_commands[slot].instanceCount = instances;
 			commands					  = true;
 		}
-	});
+	};
+	_scene->forEachVisibleSubMesh(visible, hidden);
 	if (bones.empty())
 		bones.push_back(mat4::identity());
 	const bool posed = bones.size() != _bones.size() || std::memcmp(bones.data(), _bones.data(), bones.size() * sizeof(mat4)) != 0;
@@ -641,8 +654,8 @@ Result SceneDescriptor::loadTextures() {
 			continue;
 		}
 
-		// Larger images are halved until they fit: textures have no mip maps, so more texels
-		// would only cost memory and shimmer.
+		// Larger images are halved until they fit, for memory. Every texture has its mip maps:
+		// without them a texture seen far away or at a grazing angle shimmers and moirés.
 		std::vector<stbi_uc> reduced;
 		const stbi_uc* texels = pixels;
 		while (w > kMaxTextureSize || h > kMaxTextureSize) {
@@ -671,7 +684,7 @@ Result SceneDescriptor::loadTextures() {
 			VK_FORMAT_R8G8B8A8_UNORM,
 			texels,
 			static_cast<size_t>(w) * h * 4,
-			false);
+			true);
 
 		stbi_image_free(pixels);
 
